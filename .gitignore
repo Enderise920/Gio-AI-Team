@@ -1,6 +1,14 @@
 .venv/
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
 .DS_Store
+
+# Runtime-generated data caches (the core Sectors snapshots remain available)
+data/daily_cache.json
+data/journal_report_cache.json
+data/company_enrichment.json
