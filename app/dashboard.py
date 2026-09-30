@@ -2,6 +2,7 @@ import json
 import base64
 import html as html_lib
 import logging
+import hashlib
 import os
 import re
 from urllib.error import HTTPError
@@ -23,6 +24,23 @@ CURRENT_PAGE_KEY = str(st.query_params.get("page", "home")).lower()
 ROOT=Path(__file__).resolve().parents[1]; DATA=ROOT/'data'
 FILES={k:DATA/f for k,f in {'bagger':'bagger_scores.json','fund':'fundamentals.json','momentum':'momentum_scores.json','risk':'risk_metrics.json','profile':'company_profiles.json','daily':'daily_cache.json','journal_report_cache':'journal_report_cache.json'}.items()}
 ENRICHMENT_FILE = DATA / 'company_enrichment.json'
+
+LOCAL_PEER_GROUPS_FILE = DATA / 'local_peer_groups.json'
+def load_local_peer_groups():
+    try:
+        payload = json.loads(LOCAL_PEER_GROUPS_FILE.read_text(encoding='utf-8'))
+        groups = payload.get('groups', {})
+        return groups if isinstance(groups, dict) else {}
+    except Exception:
+        return {}
+
+LOCAL_PEER_GROUPS = load_local_peer_groups()
+def get_local_peer_group(symbol):
+    key = str(symbol or '').upper().strip()
+    if key and not key.endswith('.JK'):
+        key += '.JK'
+    group = LOCAL_PEER_GROUPS.get(key, {})
+    return group if isinstance(group, dict) else {}
 
 # RowletAI mascot asset. Falls back to a small CSS owl if the image is unavailable.
 MASCOT_FILE = ROOT / "assets" / "rowlet_ai_mascot.png"
@@ -2419,71 +2437,92 @@ MI_SECTOR_SLUGS={
 }
 
 
-def mi_company_sector_map():
-    """Build a cached symbol -> sector map from the Sectors v2 companies screener."""
-    token=(mi_secret('SECTORS_API_KEY') or mi_secret('SECTORS_API_TOKEN')
-           or mi_secret('SECTORS_TOKEN') or mi_secret('SECTORS_API'))
-    if not token:
+def _mi_sectors_token():
+    return (mi_secret('SECTORS_API_KEY') or mi_secret('SECTORS_API_TOKEN')
+            or mi_secret('SECTORS_TOKEN') or mi_secret('SECTORS_API'))
+
+
+def _mi_sectors_token_fingerprint(token):
+    return hashlib.sha256(str(token).encode('utf-8')).hexdigest()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _mi_company_sector_map_cached(token_fingerprint):
+    """Cache sector membership for one hour, keyed by a non-reversible API-key fingerprint."""
+    token = _mi_sectors_token()
+    if not token or _mi_sectors_token_fingerprint(token) != token_fingerprint:
         return {}
-    mapping={}
-    for offset in range(0,1000,200):
-        params=urlencode({'limit':200,'offset':offset,'include_query_values':'true'})
-        payload=mi_sectors_api_request(f'https://api.sectors.app/v2/companies/?{params}',token)
-        rows=mi_extract_company_rows(payload)
+    mapping = {}
+    for offset in range(0, 1000, 200):
+        params = urlencode({'limit': 200, 'offset': offset, 'include_query_values': 'true'})
+        payload = mi_sectors_api_request(f'https://api.sectors.app/v2/companies/?{params}', token)
+        rows = mi_extract_company_rows(payload)
         if not rows:
             break
         for item in rows:
-            sym=item.get('symbol') or item.get('ticker') or item.get('code')
-            sector=item.get('sector') or item.get('sector_name') or item.get('sectorName')
+            sym = item.get('symbol') or item.get('ticker') or item.get('code')
+            sector = item.get('sector') or item.get('sector_name') or item.get('sectorName')
             if sym and sector:
-                sym=str(sym).upper().strip()
+                sym = str(sym).upper().strip()
                 if not sym.endswith('.JK'):
                     sym += '.JK'
-                mapping[sym]=str(sector).strip()
-        if len(rows)<200:
+                mapping[sym] = str(sector).strip()
+        if len(rows) < 200:
             break
     return mapping
 
 
-def mi_sector_symbols(selected_sector):
-    """Resolve a sector to IDX symbols. Use the documented kebab-case sector slug first,
-    then fall back to the cached full-company map and local data.
-    """
-    sector=str(selected_sector or '').strip()
-    if not sector or sector=='ALL SECTORS':
+def mi_company_sector_map():
+    """Return cached Sectors v2 company-to-sector membership."""
+    token = _mi_sectors_token()
+    if not token:
+        return {}
+    return _mi_company_sector_map_cached(_mi_sectors_token_fingerprint(token))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _mi_sector_symbols_cached(sector, slug, token_fingerprint):
+    """Cache a sector lookup for one hour without tying it to a raw API secret."""
+    token = _mi_sectors_token()
+    if not token or _mi_sectors_token_fingerprint(token) != token_fingerprint:
         return []
-    token=(mi_secret('SECTORS_API_KEY') or mi_secret('SECTORS_API_TOKEN')
-           or mi_secret('SECTORS_TOKEN') or mi_secret('SECTORS_API'))
-    slug=MI_SECTOR_SLUGS.get(sector, mi_normalize_sector(sector))
-    if token:
-        symbols=[]
-        for offset in range(0,1000,200):
-            # Sectors screener accepts SQL-like where; sector values use kebab-case slugs.
-            where=f"sector='{slug}'"
-            params=urlencode({'where':where,'limit':200,'offset':offset,'include_query_values':'true'})
-            payload=mi_sectors_api_request(f'https://api.sectors.app/v2/companies/?{params}',token)
-            rows=mi_extract_company_rows(payload)
-            if not rows:
-                break
-            for item in rows:
-                sym=item.get('symbol') or item.get('ticker') or item.get('code')
-                if sym:
-                    sym=str(sym).upper().strip()
-                    if not sym.endswith('.JK'):
-                        sym += '.JK'
-                    # If the response includes sector, enforce it; otherwise trust server-side filter.
-                    row_sector=item.get('sector') or item.get('sector_name') or item.get('sectorName')
-                    if row_sector is None or mi_normalize_sector(row_sector)==mi_normalize_sector(slug):
-                        symbols.append(sym)
-            if len(rows)<200:
-                break
-        if symbols:
-            return sorted(set(symbols))
-    # Fallback: fetch the screener map and normalize both spaces and hyphens.
-    mapping=mi_company_sector_map()
-    target=mi_normalize_sector(slug)
-    found=[sym for sym,value in mapping.items() if mi_normalize_sector(value)==target]
-    return sorted(set(found))
+    symbols = []
+    for offset in range(0, 1000, 200):
+        where = f"sector='{slug}'"
+        params = urlencode({'where': where, 'limit': 200, 'offset': offset, 'include_query_values': 'true'})
+        payload = mi_sectors_api_request(f'https://api.sectors.app/v2/companies/?{params}', token)
+        rows = mi_extract_company_rows(payload)
+        if not rows:
+            break
+        for item in rows:
+            sym = item.get('symbol') or item.get('ticker') or item.get('code')
+            if not sym:
+                continue
+            sym = str(sym).upper().strip()
+            if not sym.endswith('.JK'):
+                sym += '.JK'
+            row_sector = item.get('sector') or item.get('sector_name') or item.get('sectorName')
+            if row_sector is None or mi_normalize_sector(row_sector) == mi_normalize_sector(slug):
+                symbols.append(sym)
+        if len(rows) < 200:
+            break
+    if symbols:
+        return sorted(set(symbols))
+    mapping = mi_company_sector_map()
+    target = mi_normalize_sector(slug)
+    return sorted({sym for sym, value in mapping.items() if mi_normalize_sector(value) == target})
+
+
+def mi_sector_symbols(selected_sector):
+    """Resolve a sector to IDX symbols using a one-hour cached Sectors lookup."""
+    sector = str(selected_sector or '').strip()
+    if not sector or sector == 'ALL SECTORS':
+        return []
+    token = _mi_sectors_token()
+    if not token:
+        return []
+    slug = MI_SECTOR_SLUGS.get(sector, mi_normalize_sector(sector))
+    return _mi_sector_symbols_cached(sector, slug, _mi_sectors_token_fingerprint(token))
 
 
 def mi_sector_filter_symbols(df, selected_sector):
@@ -2557,33 +2596,34 @@ def normalize_sectors_company_report(payload):
 
 
 def fetch_sectors_company_report(symbol, force=False):
-    """Use a 24-hour report cache and stale data as fallback during API outages."""
+    """Fetch a Company Report, retain stale data, and expose safe status metadata."""
     from datetime import datetime, timezone, timedelta
     sym=_journal_report_symbol(symbol)
     cache=load_journal_report_cache()
     cached_entry=cache.get(sym) if isinstance(cache.get(sym),dict) else {}
     cached_report=cached_entry.get('report') if isinstance(cached_entry.get('report'),dict) else None
-    try:
-        stamp=str(cached_entry.get('fetched_at') or '').replace('Z','+00:00')
-        fetched_at=datetime.fromisoformat(stamp) if stamp else None
-        if fetched_at and fetched_at.tzinfo is None:
-            fetched_at=fetched_at.replace(tzinfo=timezone.utc)
-    except Exception:
-        fetched_at=None
-    try:
-        checked_stamp=str(cached_entry.get('checked_at') or '').replace('Z','+00:00')
-        checked_at=datetime.fromisoformat(checked_stamp) if checked_stamp else None
-        if checked_at and checked_at.tzinfo is None:
-            checked_at=checked_at.replace(tzinfo=timezone.utc)
-    except Exception:
-        checked_at=None
+    def parse_stamp(value):
+        try:
+            stamp=datetime.fromisoformat(str(value or '').replace('Z','+00:00'))
+            return stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
+        except Exception:
+            return None
+    fetched_at=parse_stamp(cached_entry.get('fetched_at'))
+    checked_at=parse_stamp(cached_entry.get('checked_at'))
     now=datetime.now(timezone.utc)
     if not force and cached_report and fetched_at and now-fetched_at<timedelta(hours=24):
+        st.session_state['_journal_company_report_status']={'status':'cached','checked_at':cached_entry.get('checked_at') or cached_entry.get('fetched_at') or ''}
         return cached_report
+    if force and cached_entry.get('api_status')=='rate_limited' and checked_at and now-checked_at<timedelta(minutes=1):
+        st.session_state['_journal_company_report_status']={'status':'rate_limited','checked_at':cached_entry.get('checked_at') or ''}
+        return cached_report
+
     if not force and checked_at and now-checked_at<timedelta(hours=6):
+        st.session_state['_journal_company_report_status']={'status':cached_entry.get('api_status') or 'recently_checked','checked_at':cached_entry.get('checked_at') or ''}
         return cached_report
     token=(journal_secret('SECTORS_API_KEY') or journal_secret('SECTORS_API_TOKEN') or journal_secret('SECTORS_TOKEN') or journal_secret('SECTORS_API'))
     if not token:
+        st.session_state['_journal_company_report_status']={'status':'missing_api_key','checked_at':''}
         return cached_report
     url=f"https://api.sectors.app/v2/company/report/{quote(sym,safe='')}/"
     headers_list=[
@@ -2592,6 +2632,7 @@ def fetch_sectors_company_report(symbol, force=False):
         {'X-API-Key':str(token),'User-Agent':'RowletAI/2.0'},
     ]
     payload=None
+    last_status='network_error'
     for headers in headers_list:
         try:
             req=Request(url,headers=headers)
@@ -2599,37 +2640,51 @@ def fetch_sectors_company_report(symbol, force=False):
                 candidate=json.loads(response.read().decode('utf-8'))
             if isinstance(candidate,dict) and candidate:
                 payload=candidate
+                last_status='ok'
                 break
+            last_status='empty_response'
+            break
         except HTTPError as exc:
             if exc.code in (401,403):
+                last_status='authentication_failed'
                 continue
+            if exc.code==429:
+                last_status='rate_limited'
+            elif exc.code==404:
+                last_status='symbol_not_found'
+            else:
+                last_status=f'http_{exc.code}'
             break
         except Exception:
+            last_status='network_or_invalid_response'
             break
     checked_now=datetime.now(timezone.utc).isoformat()
     if not isinstance(payload,dict):
-        if cached_entry:
-            cache[sym]={**cached_entry,'checked_at':checked_now}
-        else:
-            cache[sym]={'checked_at':checked_now}
+        cache[sym]={**cached_entry,'checked_at':checked_now,'api_status':last_status}
         save_journal_report_cache(cache)
+        st.session_state['_journal_company_report_status']={'status':last_status,'checked_at':checked_now}
         return cached_report
     report=normalize_sectors_company_report(payload)
     if not report:
+        cache[sym]={**cached_entry,'checked_at':checked_now,'api_status':'empty_response'}
+        save_journal_report_cache(cache)
+        st.session_state['_journal_company_report_status']={'status':'empty_response','checked_at':checked_now}
         return cached_report
     cache[sym]={
         'source':'Sectors API v2 Company Report',
         'fetched_at':checked_now,
         'checked_at':checked_now,
+        'api_status':'ok',
         'report':report,
         'raw':payload,
     }
     save_journal_report_cache(cache)
+    st.session_state['_journal_company_report_status']={'status':'ok','checked_at':checked_now}
     return report
 
 
-def journal_report_for_symbol(symbol):
-    return fetch_sectors_company_report(symbol, force=False)
+def journal_report_for_symbol(symbol, force=False):
+    return fetch_sectors_company_report(symbol, force=force)
 
 
 def journal_apply_report_context(row, report):
@@ -36995,7 +37050,34 @@ The position shows its Momentum and Quality score, the size shows the Bagger Sco
                     xaxis=dict(title="Momentum Score",range=[0,100],gridcolor="rgba(23,105,255,.08)",title_font=dict(size=13),tickfont=dict(size=10)),
                     yaxis=dict(title="Quality Score",range=[0,100],gridcolor="rgba(23,105,255,.08)",title_font=dict(size=13),tickfont=dict(size=10)),
                 )
-                st.plotly_chart(fig,use_container_width=True,config={"displaylogo":False,"scrollZoom":True,"modeBarButtonsToRemove":["lasso2d","select2d"]},key="mi3_intelligence_map")
+                mi3_map_symbols = set(filtered.loc[filtered.bagger_score.notna(), "symbol"].astype(str)) if "bagger_score" in filtered else set()
+
+                def _select_mi3_company_from_map():
+                    chart_state = st.session_state.get("mi3_intelligence_map")
+                    try:
+                        points = chart_state.selection.points
+                    except (AttributeError, TypeError):
+                        points = []
+                    if not points:
+                        return
+
+                    point_data = points[0].get("customdata")
+                    if isinstance(point_data, (list, tuple, np.ndarray)):
+                        clicked_symbol = str(point_data[0]).strip() if len(point_data) else ""
+                    else:
+                        clicked_symbol = str(point_data or "").strip()
+
+                    if clicked_symbol in mi3_map_symbols:
+                        st.session_state["mi3_company"] = clicked_symbol
+
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                    on_select=_select_mi3_company_from_map,
+                    selection_mode="points",
+                    config={"displaylogo":False,"scrollZoom":True,"modeBarButtonsToRemove":["lasso2d","select2d"]},
+                    key="mi3_intelligence_map",
+                )
             else:
                 st.info("Momentum and Quality scores are required to render the intelligence map.")
 
@@ -37041,7 +37123,7 @@ The position shows its Momentum and Quality score, the size shows the Bagger Sco
                 if row is not None:
                     factors=[("Growth",row.get("growth_score")),("Quality",row.get("quality_score")),("Valuation",row.get("valuation_score")),("Momentum",row.get("momentum_score")),("Risk Strength",row.get("risk_strength"))]
                     bars=''.join([f'<div class="mi3-s36-bar-row"><label>{name}</label><b>{"—" if pd.isna(pd.to_numeric(v,errors="coerce")) else f"{float(v):.1f}"}</b><div class="mi3-s36-bar"><i style="width:{0 if pd.isna(pd.to_numeric(v,errors="coerce")) else max(0,min(100,float(v))):.1f}%"></i></div></div>' for name,v in factors])
-                    st.html(f'<section id="mi-step-5" class="mi3-s36-inner"><div class="mi3-panel-top"><span class="mi3-chip">STEP 5</span><span class="mi3-kicker">UNDERSTAND THE SIGNALS</span></div><h3>What drives this score?</h3><p>How the selected company scores across the key assessment factors.</p><div class="mi3-s36-bars">{bars}</div><div class="mi3-s36-takeaway"><b>💡 Key Takeaways</b><br>• Review the strongest factors first.<br>• Compare Momentum and Quality together.<br>• Use Evidence and Risk Strength as confirmation.</div></section>')
+                    st.html(f'<section id="mi-step-5" class="mi3-s36-inner"><div class="mi3-panel-top"><span class="mi3-chip">STEP 5</span><span class="mi3-kicker">UNDERSTAND THE SIGNALS</span></div><h3>What drives this score?</h3><p>How the selected company scores across the key assessment factors.</p><div class="mi3-s36-bars">{bars}</div><div class="mi3-s36-takeaway"><b>📘 How to read these signals</b><br>• Start with the highest and lowest factors.<br>• Read Momentum alongside Quality.<br>• Check Evidence and Risk Strength before drawing a conclusion.</div></section>')
                 else:
                     st.html('<section id="mi-step-5" class="mi3-s36-inner"><div class="mi3-panel-top"><span class="mi3-chip">STEP 5</span><span class="mi3-kicker">UNDERSTAND THE SIGNALS</span></div><h3>What drives this score?</h3><p>Select a company above to see its assessment factors.</p></section>')
 
@@ -37050,7 +37132,8 @@ The position shows its Momentum and Quality score, the size shows the Bagger Sco
         with st.container(border=True,key="mi3_step6_card"):
             st.markdown('<span class="mi3-s36-marker"></span>',unsafe_allow_html=True)
             with st.container(border=True,key="mi3_step6_inner"):
-                st.html("""
+                journal_href = "?" + urlencode({"page": "journal", "symbol": str(selected_symbol)}) if selected_symbol else "?page=journal"
+                st.html(f"""
                 <section id="mi-step-6" class="mi3-s36-inner mi3-s36-journal">
                   <div class="mi3-panel-top"><span class="mi3-chip">STEP 6</span><span class="mi3-kicker">GO DEEPER</span></div>
                   <h3>Open Company Journal</h3>
@@ -37059,7 +37142,7 @@ The position shows its Momentum and Quality score, the size shows the Bagger Sco
                     <div><span>✓</span>Quantitative Signals</div><div><span>✓</span>6 Key Assessment Factors</div><div><span>✓</span>Financial Snapshot</div>
                     <div><span>✓</span>Momentum &amp; Risk Analysis</div><div><span>✓</span>Business Profile</div><div><span>✓</span>Evidence &amp; Explanation</div>
                   </div>
-                  <a class="mi3-s36-cta" href="?page=journal">OPEN COMPANY JOURNAL →</a>
+                  <a class="mi3-s36-cta" href="{html_lib.escape(journal_href, quote=True)}">OPEN COMPANY JOURNAL →</a>
                 </section>
                 """)
 
@@ -37467,36 +37550,28 @@ def journal_save_daily_cache(cache):
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def journal_daily_api(symbol, days=120):
-    """Fetch one ticker's daily history from Sectors v2 using an explicit date range.
-
-    The bare /daily/{symbol}/ endpoint may return only a short recent slice. For
-    60D evidence we explicitly request a recent calendar window so the response
-    contains enough trading observations for 60-session calculations.
-    """
+def journal_daily_api(symbol, days=90):
+    """Fetch daily history and return rows with a user-displayable status."""
     sym=str(symbol or '').upper().strip()
     if not sym:
-        return []
+        return {"rows": [], "status": "invalid_symbol"}
     token=(journal_secret('SECTORS_API_KEY') or journal_secret('SECTORS_API_TOKEN') or
            journal_secret('SECTORS_TOKEN') or journal_secret('SECTORS_API'))
     if not token:
-        return []
-
-    # Sectors daily supports start/end. Keep the window within the recent range
-    # supported by the endpoint while leaving enough room for 60 trading days.
+        return {"rows": [], "status": "missing_api_key"}
+    api_symbol=sym[:-3] if sym.endswith('.JK') else sym
     from datetime import datetime, timedelta
     end_date=datetime.now().date()
-    start_date=end_date-timedelta(days=max(int(days),120))
-    base_url=f"https://api.sectors.app/v2/daily/{quote(sym, safe='')}/"
+    window_days=min(max(int(days),1),90)
+    start_date=end_date-timedelta(days=window_days)
+    base_url=f"https://api.sectors.app/v2/daily/{quote(api_symbol, safe='')}/"
     url=base_url+f"?start={start_date.isoformat()}&end={end_date.isoformat()}"
-
-    # Current Sectors guidance uses the raw API key in Authorization. Keep the
-    # compatibility variants as fallbacks for existing local environments.
     headers_list=[
         {'Authorization':str(token),'User-Agent':'RowletAI/2.0'},
         {'Authorization':f'Bearer {token}','User-Agent':'RowletAI/2.0'},
         {'X-API-Key':str(token),'User-Agent':'RowletAI/2.0'},
     ]
+    last_status="network_error"
     for headers in headers_list:
         try:
             req=Request(url,headers=headers)
@@ -37505,8 +37580,8 @@ def journal_daily_api(symbol, days=120):
             rows=payload.get('data') if isinstance(payload,dict) else payload
             if isinstance(rows,dict):
                 rows=list(rows.values())
+            clean_rows=[]
             if isinstance(rows,list):
-                clean_rows=[]
                 for item in rows:
                     if not isinstance(item,dict):
                         continue
@@ -37514,15 +37589,26 @@ def journal_daily_api(symbol, days=120):
                     date=item.get('date', item.get('datetime', item.get('timestamp')))
                     if not np.isnan(close) and close>0 and date:
                         clean_rows.append({**item,'symbol':sym,'close':float(close),'date':str(date)})
-                if clean_rows:
-                    return clean_rows
+            if clean_rows:
+                return {"rows": clean_rows, "status": "ok"}
+            last_status="empty_response"
+        except HTTPError as exc:
+            if exc.code in (401,403):
+                last_status="authentication_failed"
+                continue
+            if exc.code==404:
+                last_status="symbol_not_found"
+                break
+            else:
+                last_status=f"http_error_{exc.code}"
         except Exception:
-            continue
-    return []
+            last_status="network_or_invalid_response"
+    return {"rows": [], "status": last_status}
+
 
 
 def journal_daily_history(symbol, minimum_rows=61):
-    """Refresh stale or incomplete daily history, with a six-hour retry cooldown."""
+    """Refresh daily history and retain a compact diagnostic for the Journal UI."""
     from datetime import datetime, timezone, timedelta
     sym=str(symbol or '').upper().strip()
     try:
@@ -37540,14 +37626,12 @@ def journal_daily_history(symbol, minimum_rows=61):
     else:
         existing=entry
     existing=existing if isinstance(existing,list) else []
-
     def parse_stamp(value):
         try:
             stamp=datetime.fromisoformat(str(value or '').replace('Z','+00:00'))
             return stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
         except Exception:
             return None
-
     def frame(rows):
         h=pd.DataFrame(rows)
         if h.empty:
@@ -37559,12 +37643,10 @@ def journal_daily_history(symbol, minimum_rows=61):
         h['date']=pd.to_datetime(h[dc],errors='coerce')
         h['close']=pd.to_numeric(h[cc],errors='coerce')
         return h.dropna(subset=['date','close']).sort_values('date').drop_duplicates('date')
-
     now=datetime.now(timezone.utc)
     h=frame(existing)
     checked_at=parse_stamp(metadata.get('checked_at'))
     if checked_at is None:
-        # Older cache entries have no fetch timestamp; use their latest trading date once.
         latest=None
         if not h.empty:
             try:
@@ -37576,23 +37658,51 @@ def journal_daily_history(symbol, minimum_rows=61):
         checked_at=now-timedelta(hours=12) if latest is None or now-latest>timedelta(days=4) else now
     needs_refresh=len(h)<minimum_rows or now-checked_at>=timedelta(hours=6)
     if needs_refresh:
-        fresh=journal_daily_api(sym)
+        api_result=journal_daily_api(sym)
+        if isinstance(api_result,dict):
+            fresh=api_result.get('rows') or []
+            api_status=str(api_result.get('status') or 'unknown')
+        else:
+            fresh=api_result if isinstance(api_result,list) else []
+            api_status='ok' if fresh else 'unknown'
         checked_now=datetime.now(timezone.utc).isoformat()
         if fresh:
             merged=frame(existing+fresh)
             if not merged.empty:
                 records=merged.assign(date=merged['date'].dt.strftime('%Y-%m-%d')).to_dict('records')
-                cache[sym]={'data':records,'fetched_at':checked_now,'checked_at':checked_now}
+                cache[sym]={'data':records,'fetched_at':checked_now,'checked_at':checked_now,'api_status':'ok'}
                 journal_save_daily_cache(cache)
                 h=merged
             else:
-                cache[sym]={'data':existing,'fetched_at':metadata.get('fetched_at'),'checked_at':checked_now}
+                cache[sym]={'data':existing,'fetched_at':metadata.get('fetched_at'),'checked_at':checked_now,'api_status':'empty_response'}
                 journal_save_daily_cache(cache)
+                api_status='empty_response'
         else:
-            # Remember failed refresh attempts so reruns do not repeat a slow API call.
-            cache[sym]={'data':existing,'fetched_at':metadata.get('fetched_at'),'checked_at':checked_now}
+            cache[sym]={'data':existing,'fetched_at':metadata.get('fetched_at'),'checked_at':checked_now,'api_status':api_status}
             journal_save_daily_cache(cache)
+    current_entry=cache.get(sym) if isinstance(cache.get(sym),dict) else {}
+    api_status=str(current_entry.get('api_status') or 'not_checked')
+    if h.empty:
+        display_status=api_status
+    elif api_status not in {'ok','not_checked'}:
+        display_status='stale_cache'
+    elif len(h)<minimum_rows:
+        display_status='partial_history'
+    else:
+        display_status='available'
+    as_of=''
+    if not h.empty:
+        try:
+            as_of=pd.Timestamp(h['date'].max()).strftime('%Y-%m-%d')
+        except Exception:
+            pass
+    st.session_state['journal_daily_data_status']={
+        'symbol':sym,'status':display_status,'api_status':api_status,'rows':int(len(h)),
+        'minimum_rows':int(minimum_rows),'as_of':as_of,
+        'checked_at':current_entry.get('checked_at') or metadata.get('checked_at') or '',
+    }
     return h
+
 
 
 def journal_daily_metrics(symbol):
@@ -37661,7 +37771,13 @@ def journal_dynamic_scores(symbol, row, daily_metrics):
         if not mdf.empty and c in mdf.columns:
             ref=pd.to_numeric(mdf[c],errors='coerce').dropna()
             if len(ref)>=5:
-                # Rank including the selected company's verified observation.
+                # Exclude the selected company from the reference population before ranking.
+                ref_symbols=mdf.get("symbol",pd.Series(dtype=str)).astype(str).str.upper().str.strip()
+                target_key=sym[:-3] if sym.endswith(".JK") else sym
+                if len(ref_symbols)==len(mdf):
+                    ref=ref.loc[~ref_symbols.str.replace(r"\.JK$","",regex=True).eq(target_key)]
+                if len(ref)<5:
+                    continue
                 combined=pd.concat([ref,pd.Series([v])],ignore_index=True)
                 pct=float(combined.rank(method='average',pct=True).iloc[-1]*100)
                 mom_vals.append(pct)
@@ -37696,6 +37812,12 @@ def journal_dynamic_scores(symbol, row, daily_metrics):
         if not rdf.empty and c in rdf.columns:
             ref=pd.to_numeric(rdf[c],errors='coerce').dropna()
             if len(ref)>=5:
+                ref_symbols=rdf.get("symbol",pd.Series(dtype=str)).astype(str).str.upper().str.strip()
+                target_key=sym[:-3] if sym.endswith(".JK") else sym
+                if len(ref_symbols)==len(rdf):
+                    ref=ref.loc[~ref_symbols.str.replace(r"\.JK$","",regex=True).eq(target_key)]
+                if len(ref)<5:
+                    continue
                 combined=pd.concat([ref,pd.Series([v])],ignore_index=True)
                 pct=float(combined.rank(method='average',pct=True).iloc[-1]*100)
                 if not higher_better:
@@ -37710,29 +37832,34 @@ def journal_dynamic_scores(symbol, row, daily_metrics):
 
 
 def journal_apply_dynamic_scores(row, symbol, daily_metrics):
+    """Keep published scores canonical; fill a missing score only with complete live evidence."""
+    canonical_score=n(row.get('bagger_score'))
+    canonical_signal=row.get('composite_signal')
+    canonical_evidence=row.get('evidence_level')
     scores=journal_dynamic_scores(symbol,row,daily_metrics)
+    dynamic_used=bool({'momentum_score','risk_strength'} & set(scores))
     for k,v in scores.items():
         row[k]=v
-    # Rebuild the five-dimension Bagger composite only when all five dimensions
-    # are verified. The frozen methodology weights remain unchanged.
-    dims={
-        'growth_score':0.25,
-        'quality_score':0.20,
-        'valuation_score':0.20,
-        'momentum_score':0.20,
-        'risk_strength':0.15,
-    }
+    dims={'growth_score':0.25,'quality_score':0.20,'valuation_score':0.20,'momentum_score':0.20,'risk_strength':0.15}
     vals={k:n(row.get(k)) for k in dims}
     available=sum(np.isfinite(v) for v in vals.values())
     row['available_dimensions']=available
-    if available==5:
+    if np.isfinite(canonical_score):
+        row['bagger_score']=canonical_score
+        row['composite_signal']=canonical_signal or 'QUANTITATIVE_COMPOSITE'
+        row['evidence_level']=canonical_evidence or '—'
+        row['journal_score_provenance']='Published Market Intelligence score snapshot; live daily evidence is presented separately.'
+    elif available==5 and dynamic_used:
         row['bagger_score']=float(sum(vals[k]*w for k,w in dims.items()))
-        row['evidence_level']='HIGH'
+        row['evidence_level']='MEDIUM'
         row['composite_signal']='QUANTITATIVE_COMPOSITE'
+        row['journal_score_provenance']='Journal-only estimate: stored fundamentals and valuation plus daily-price momentum and risk. Market Intelligence has no published score for this company.'
     else:
         row['bagger_score']=np.nan
         row['composite_signal']='INSUFFICIENT_EVIDENCE'
+        row['journal_score_provenance']=f'Score unavailable: {available} of 5 required dimensions currently have eligible values.'
     return row
+
 
 
 def journal_value(v, suffix='', decimals=1):
@@ -39126,32 +39253,51 @@ def journal_logo_url(symbol):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def _journal_image_url_allowed(image_url):
+    """Allow server-side image fetches only from the providers used by the app."""
+    try:
+        parts=urlsplit(str(image_url or '').strip())
+        host=(parts.hostname or '').lower().rstrip('.')
+        trusted=('images.unsplash.com','images.pexels.com','cdn.pixabay.com')
+        return parts.scheme.lower()=='https' and any(host==domain or host.endswith('.'+domain) for domain in trusted)
+    except Exception:
+        return False
+
+
 def _journal_embed_remote_image(image_url, provider=""):
-    """Fetch a selected provider image server-side and return a browser-safe data URL."""
+    """Fetch a bounded image from an approved provider and reject unsafe redirects."""
     if not image_url:
         return ""
     if str(image_url).startswith("data:image/"):
         return str(image_url)
+    if not _journal_image_url_allowed(image_url):
+        return ""
     try:
-        req=Request(str(image_url),headers={
-            "User-Agent":"RowletAI/2.0",
-            "Accept":"image/avif,image/webp,image/jpeg,image/png,image/*;q=0.8",
-        })
-        with urlopen(req, timeout=12) as response:
-            raw=response.read()
+        from urllib.request import HTTPRedirectHandler, build_opener
+        class _TrustedImageRedirect(HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                if not _journal_image_url_allowed(newurl):
+                    return None
+                return super().redirect_request(req,fp,code,msg,headers,newurl)
+        req=Request(str(image_url),headers={"User-Agent":"RowletAI/2.0","Accept":"image/avif,image/webp,image/jpeg,image/png,image/*;q=0.8"})
+        opener=build_opener(_TrustedImageRedirect())
+        with opener.open(req,timeout=12) as response:
+            if not _journal_image_url_allowed(response.geturl()):
+                return ""
             content_type=(response.headers.get_content_type() or "").lower()
-        if not raw or len(raw) > 8_000_000:
+            content_length=response.headers.get('Content-Length')
+            if content_length and int(content_length)>8_000_000:
+                return ""
+            raw=response.read(8_000_001)
+        if not raw or len(raw)>8_000_000:
             return ""
         if content_type not in {"image/jpeg","image/png","image/webp","image/gif","image/avif"}:
-            low=str(image_url).lower()
-            if ".png" in low: content_type="image/png"
-            elif ".webp" in low: content_type="image/webp"
-            elif ".gif" in low: content_type="image/gif"
-            else: content_type="image/jpeg"
+            return ""
         import base64
-        return "data:%s;base64,%s" % (content_type, base64.b64encode(raw).decode("ascii"))
+        return "data:%s;base64,%s" % (content_type,base64.b64encode(raw).decode("ascii"))
     except Exception:
         return ""
+
 
 
 # Last-resort visual references. These are only used when all configured API
@@ -39319,7 +39465,6 @@ def _journal_normalize_visual_sector(value):
     }
     return aliases.get(text, text)
 
-
 def _journal_static_fallback(row, symbol):
     sym = str(symbol or row.get("symbol") or "").upper().strip()
     item = JOURNAL_STATIC_VISUAL_FALLBACKS.get(sym)
@@ -39485,10 +39630,11 @@ def journal_live_price(symbol):
     sym=str(symbol or "").upper().strip()
     if not sym:
         return None
+    api_symbol=sym[:-3] if sym.endswith('.JK') else sym
     sectors_token=(journal_secret("SECTORS_API_KEY") or journal_secret("SECTORS_API_TOKEN") or journal_secret("SECTORS_TOKEN") or journal_secret("SECTORS_API"))
     if sectors_token:
         try:
-            url=f"https://api.sectors.app/v2/daily/{quote(sym, safe='')}/"
+            url=f"https://api.sectors.app/v2/daily/{quote(api_symbol, safe='')}/"
             headers_list=[
                 {"Authorization":f"Bearer {sectors_token}","User-Agent":"RowletAI/2.0"},
                 {"Authorization":str(sectors_token),"User-Agent":"RowletAI/2.0"},
@@ -39931,9 +40077,32 @@ def journal():
     st.markdown(f'<div class="journal-shell"><div class="journal-top journal-banner">{_banner_html}</div>',unsafe_allow_html=True)
 
     companies=df.copy(); companies['display']=companies.symbol.astype(str)+' — '+companies.company_name.fillna('').astype(str); symbols=sorted(companies.display.tolist())
-    requested=str(st.query_params.get('symbol','')).upper().strip(); idx=next((i for i,x in enumerate(symbols) if x.startswith(requested+' —')),0)
-    selected=st.selectbox('Company',symbols,index=idx,key='journal_company',label_visibility='collapsed'); symbol=selected.split(' — ')[0]; row=journal_resolve_context(df[df.symbol==symbol].iloc[0]); st.query_params['symbol']=symbol
+    requested=str(st.query_params.get('symbol','')).upper().strip()
+    requested_option=next((option for option in symbols if option.split(' — ',1)[0].upper()==requested),None)
+    last_journal_symbol=str(st.session_state.get('_journal_last_company_symbol','')).upper().strip()
+    if requested_option and requested != last_journal_symbol:
+        st.session_state['journal_company']=requested_option
+    idx=symbols.index(requested_option) if requested_option in symbols else 0
+    selected=st.selectbox('Company',symbols,index=idx,key='journal_company',label_visibility='collapsed')
+    symbol=selected.split(' — ')[0]
+    st.session_state['_journal_last_company_symbol']=symbol.upper()
+    row=journal_resolve_context(df[df.symbol==symbol].iloc[0])
+    if st.query_params.get('symbol') != symbol:
+        st.query_params['symbol']=symbol
     journal_report=journal_report_for_symbol(symbol)
+    if not journal_report:
+        if st.button('↻ Retry Sectors Company Report',key='journal_retry_company_report',help='Make one new request for this company report.'):
+            journal_report=journal_report_for_symbol(symbol, force=True)
+        _report_status=st.session_state.get('_journal_company_report_status',{})
+        _report_status_code=str(_report_status.get('status') or 'no_cached_report')
+        if _report_status_code=='rate_limited':
+            st.warning('Sectors API is rate-limiting the Company Report (HTTP 429). Price history is loaded separately; financials and company classifications remain unavailable until a report request succeeds.')
+        elif _report_status_code=='missing_api_key':
+            st.warning('Sectors API credentials are not configured. Company Report fields can only come from an existing cache.')
+        elif _report_status_code=='symbol_not_found':
+            st.info('Sectors API did not return a Company Report for this symbol.')
+        else:
+            st.info('No Company Report data is cached for this company. Use Retry to make one new Sectors API request; unavailable fields remain N/A until verified data is returned.')
     row=pd.Series(journal_apply_report_context(row, journal_report))
     # Dividend Quality Score is a separate evidence layer; it does not feed
     # the five Bagger dimensions. Missing evidence remains N/A, never zero.
@@ -39956,10 +40125,36 @@ def journal():
     row['earnings_coverage']=(1.0/_payout) if np.isfinite(_payout) and _payout>0 else np.nan
     row['cash_flow_coverage']=(1.0/_cash_payout) if (not _is_bank and np.isfinite(_cash_payout) and _cash_payout>0) else np.nan
     h=journal_daily_frame if not journal_daily_frame.empty else history(symbol); current_price=None if h.empty else float(h.iloc[-1]['close']); current_price = current_price if current_price is not None else journal_live_price(symbol)
+    history_as_of=pd.Timestamp(h['date'].max()).strftime('%Y-%m-%d') if not h.empty else ""
+    history_rows=int(len(h))
+    daily_status=st.session_state.get('journal_daily_data_status',{})
+    if not isinstance(daily_status,dict) or daily_status.get('symbol')!=symbol:
+        daily_status={'status':'available' if not h.empty else 'not_checked','api_status':'not_checked'}
+    history_state=str(daily_status.get('status') or 'not_checked')
+    failure_text={'missing_api_key':'Sectors API key is not configured.','authentication_failed':'The Sectors API rejected the configured key.','symbol_not_found':f'The Sectors API did not recognize {symbol}; the dashboard sends the ticker without .JK.','empty_response':'The API returned no usable daily closing prices.','network_error':'The daily price service could not be reached.','network_or_invalid_response':'The daily price service could not be reached or returned an invalid response.'}
+    if h.empty:
+        history_message=failure_text.get(str(daily_status.get('api_status') or history_state),'Daily price history is not available in the local cache.')
+    elif history_state=='stale_cache' or daily_status.get('api_status') not in {'ok','not_checked','',None}:
+        history_message=f'Using available local history through {history_as_of}; last Sectors daily refresh: {failure_text.get(str(daily_status.get("api_status")),"failed")}'
+    elif history_state=='partial_history':
+        history_message=f'Only {history_rows} daily observations through {history_as_of}; 61 are needed for 20D and 60D evidence.'
+    else:
+        history_message=f'Daily price cache: {history_rows} observations through {history_as_of}.' if history_as_of else 'Daily prices are available in the local cache.'
+    history_note_html=escape_html(history_message)
     if current_price is None and isinstance(journal_report,dict):
         report_price=n(journal_report.get('last_close_price'))
         current_price=None if np.isnan(report_price) else report_price
     fc=journal_forecast(row, report=journal_report); score=n(row.get('bagger_score')); signal=str(row.get('composite_signal','—')).replace('_',' ').upper(); evidence=str(row.get('evidence_level','—')).replace('_',' ').upper(); cov_n,cov_t,cov_pct=journal_coverage(row); visuals=journal_business_visual(row, symbol)
+    score_provenance=str(row.get('journal_score_provenance') or 'Published Market Intelligence score snapshot.')
+    if np.isfinite(score) and score_provenance.startswith('Published Market Intelligence'):
+        try:
+            from datetime import datetime
+            snapshot_refresh=datetime.fromtimestamp(FILES['bagger'].stat().st_mtime).strftime('%Y-%m-%d')
+            score_provenance += f' Score file last refreshed {snapshot_refresh}.'
+        except Exception:
+            pass
+    score_provenance_html=escape_html(score_provenance)
+    score_heading='JOURNAL ESTIMATE' if str(row.get('journal_score_provenance') or '').startswith('Journal-only estimate:') else 'BAGGER SCORE'
 
     # 01 — COMPANY HEADER
     st.markdown('<div class="j-section"><span class="j-rail">01</span><span class="j-section-title">Company Header</span><span class="j-section-desc">Identity, market context & business activity</span></div>',unsafe_allow_html=True)
@@ -40189,9 +40384,11 @@ def journal():
 
     score_txt='N/A' if np.isnan(score) else f'{score:.1f}'
     signal_clean=signal if signal not in ("—","") else "NEUTRAL"
-    if signal_clean in ("HIGH","STRONG","POSITIVE"):
+    # Canonical snapshot states have a separate color mapping from peer-relative Research View.
+    signal_key=re.sub(r"[^A-Z0-9]+","_",signal_clean).strip("_")
+    if signal_key in ("HIGH","STRONG","POSITIVE","STRONG_COMPOSITE"):
         research_class="positive"
-    elif signal_clean in ("LOW","CAUTION","NEGATIVE","LIMITED"):
+    elif signal_key in ("LOW","CAUTION","NEGATIVE","LIMITED","WEAK_COMPOSITE","LOW_COMPOSITE"):
         research_class="caution"
     else:
         research_class="neutral"
@@ -40256,9 +40453,283 @@ def journal():
         icon={"profit":"↗","value":"◈","dividend":"▣","growth":"↗","info":"i"}.get(kind,"•")
         takeaway_html += f'<div class="j-exec-take-row"><span class="j-exec-take-icon {kind}">{icon}</span><span><b>{title}</b><small>{text_value}</small></span></div>'
 
+    # 02 — RESEARCH VIEW
+    # Build this interpretation from peer distributions, separately from Bagger Score.
+    _rv_symbol = str(symbol).upper().strip()
+    _rv_row = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+    _rv_sector = str(_rv_row.get("sector") or "").strip()
+    _rv_industry = str(_rv_row.get("industry") or "").strip()
+    _rv_compare_symbol = str(st.session_state.get("ci96_selected_company", "") or "").upper().strip()
+    _rv_use_compare_state = _rv_compare_symbol == _rv_symbol
+    _rv_mode = str(st.session_state.get("ci96_mode", "Peer Universe")) if _rv_use_compare_state else "Peer Universe"
+    _rv_rule = str(st.session_state.get("ci96_peer_rule", "Same Sector")) if _rv_use_compare_state else "Same Sector"
+    _rv_manual = list(st.session_state.get("ci96_manual_peers", []) or []) if _rv_use_compare_state and _rv_mode == "Select Peer Companies" else []
+
+    def _rv_norm(value):
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+    def _rv_same(left, right):
+        left_norm, right_norm = _rv_norm(left), _rv_norm(right)
+        aliases={"consumer cyclical":"consumer cyclicals","consumer non cyclical":"consumer non cyclicals","consumer staples":"consumer non cyclicals","healthcare":"health care"}
+        left_norm=aliases.get(left_norm,left_norm)
+        right_norm=aliases.get(right_norm,right_norm)
+        return bool(left_norm and right_norm and left_norm==right_norm)
+
+    _rv_base = df.copy()
+    if "symbol" in _rv_base.columns:
+        _rv_base["symbol"] = _rv_base["symbol"].astype(str).str.upper().str.strip()
+        _rv_base = _rv_base[_rv_base["symbol"] != _rv_symbol].copy()
+    if "market_cap" in _rv_base.columns:
+        _rv_base["_rv_market_cap"] = pd.to_numeric(_rv_base["market_cap"], errors="coerce")
+    else:
+        _rv_base["_rv_market_cap"] = np.nan
+
+    _rv_target_cap = n(_rv_row.get("market_cap"))
+    _rv_peer_basis = _rv_rule if _rv_mode == "Peer Universe" else "Selected Peer Companies"
+    _rv_local_peer_group = get_local_peer_group(_rv_symbol) if _rv_mode == "Peer Universe" and _rv_rule.startswith("Same Sector") else {}
+    _rv_curated_peer_symbols = {str(item).upper().strip() for item in _rv_local_peer_group.get("peer_symbols", []) if str(item).strip()}
+    _rv_sector_symbols = set()
+    _rv_sector_source = str(_rv_local_peer_group.get("label") or "curated local peer set") if _rv_curated_peer_symbols else "local sector labels"
+    if _rv_mode == "Peer Universe" and (_rv_rule.startswith("Same Sector") or _rv_rule == "Same Industry") and _rv_sector and not _rv_curated_peer_symbols:
+        try:
+            _rv_sector_symbols = {str(item).upper().strip() for item in mi_sector_symbols(_rv_sector)}
+        except Exception:
+            _rv_sector_symbols = set()
+        if _rv_sector_symbols:
+            _rv_sector_source = "Sectors sector universe"
+
+    _rv_peer_candidates = _rv_base.iloc[0:0].copy()
+    _rv_peer_symbols = []
+    if _rv_mode == "Select Peer Companies":
+        _rv_manual = [str(item).upper().strip() for item in _rv_manual if str(item).upper().strip() != _rv_symbol][:5]
+        _rv_peer_candidates = _rv_base[_rv_base["symbol"].isin(_rv_manual)].copy()
+        _rv_peer_candidates["_rv_order"] = _rv_peer_candidates["symbol"].map({item: index for index, item in enumerate(_rv_manual)})
+        _rv_peer_candidates = _rv_peer_candidates.sort_values("_rv_order")
+        _rv_peer_basis = "Selected peer companies"
+    elif _rv_rule.startswith("Same Sector"):
+        if _rv_curated_peer_symbols:
+            _rv_peer_candidates = _rv_base[_rv_base["symbol"].isin(_rv_curated_peer_symbols)].copy()
+        elif _rv_sector_symbols:
+            _rv_peer_candidates = _rv_base[_rv_base["symbol"].isin(_rv_sector_symbols)].copy()
+        elif "sector" in _rv_base.columns and _rv_sector:
+            _rv_peer_candidates = _rv_base[_rv_base["sector"].fillna("").astype(str).map(lambda item: _rv_same(item, _rv_sector))].copy()
+        if _rv_rule == "Same Sector · Large Cap" and not _rv_peer_candidates.empty:
+            _rv_valid_caps = _rv_peer_candidates["_rv_market_cap"].dropna()
+            if len(_rv_valid_caps):
+                _rv_cap_floor = float(_rv_valid_caps.quantile(.50))
+                _rv_larger = _rv_peer_candidates[_rv_peer_candidates["_rv_market_cap"].ge(_rv_cap_floor)].copy()
+                if not _rv_larger.empty:
+                    _rv_peer_candidates = _rv_larger
+        _rv_peer_basis = f"{_rv_rule} · {_rv_sector_source}"
+    elif _rv_rule == "Same Industry":
+        if _rv_sector_symbols:
+            _rv_industry_pool = _rv_base[_rv_base["symbol"].isin(_rv_sector_symbols)].copy()
+        elif "sector" in _rv_base.columns and _rv_sector:
+            _rv_industry_pool = _rv_base[_rv_base["sector"].fillna("").astype(str).map(lambda item: _rv_same(item, _rv_sector))].copy()
+        else:
+            _rv_industry_pool = _rv_base.copy()
+        if "industry" in _rv_industry_pool.columns and _rv_industry:
+            _rv_peer_candidates = _rv_industry_pool[_rv_industry_pool["industry"].fillna("").astype(str).map(lambda item: _rv_same(item, _rv_industry))].copy()
+        _rv_peer_basis = "Same Industry · local classifications"
+    elif _rv_rule == "Similar Market Cap":
+        _rv_peer_candidates = _rv_base.copy()
+        if np.isfinite(_rv_target_cap) and _rv_target_cap > 0:
+            _rv_peer_candidates = _rv_peer_candidates[_rv_peer_candidates["_rv_market_cap"].between(_rv_target_cap * .5, _rv_target_cap * 2.0, inclusive="both")].copy()
+    else:  # Match Compare Insight's broad market-cap fallback; not an official index constituent list.
+        _rv_peer_candidates = _rv_base.sort_values("_rv_market_cap", ascending=False, na_position="last").head(100).copy()
+        _rv_peer_basis = "IDX Large Cap · available market-cap universe"
+
+    if not _rv_peer_candidates.empty and _rv_mode != "Select Peer Companies":
+        if np.isfinite(_rv_target_cap) and _rv_target_cap > 0 and _rv_peer_candidates["_rv_market_cap"].notna().any():
+            _rv_peer_candidates["_rv_distance"] = (_rv_peer_candidates["_rv_market_cap"] - _rv_target_cap).abs()
+            _rv_peer_candidates = _rv_peer_candidates.sort_values(["_rv_distance", "_rv_market_cap"], ascending=[True, False])
+        else:
+            _rv_peer_candidates = _rv_peer_candidates.sort_values("_rv_market_cap", ascending=False, na_position="last")
+        # Keep the full eligible reference population for quartiles; abbreviate only the displayed peer list.
+    _rv_peer_df = _rv_peer_candidates.copy()
+    _rv_peer_symbols = _rv_peer_df["symbol"].astype(str).tolist() if "symbol" in _rv_peer_df else []
+    _rv_peer_count = len(_rv_peer_df)
+
+    _rv_selected_pe = n(_rv_row.get("pe_ttm"))
+    _rv_positive_peer_pe = pd.to_numeric(_rv_peer_df["pe_ttm"], errors="coerce") if "pe_ttm" in _rv_peer_df else pd.Series(dtype=float)
+    _rv_positive_peer_pe = _rv_positive_peer_pe[_rv_positive_peer_pe > 0]
+    _rv_pe_threshold = max(3, int(np.ceil(_rv_peer_count * .4)))
+    _rv_valuation_key = "pe_ttm" if np.isfinite(_rv_selected_pe) and _rv_selected_pe > 0 and len(_rv_positive_peer_pe) >= _rv_pe_threshold else "pb_mrq"
+    _rv_valuation_label = "P/E" if _rv_valuation_key == "pe_ttm" else "P/B"
+    _rv_metric_specs = [
+        ("Quality", "ROE", "roe_ttm", "pct", True),
+        ("Quality", "ROA", "roa_ttm", "pct", True),
+        ("Valuation", _rv_valuation_label, _rv_valuation_key, "multiple", False),
+        ("Growth", "Revenue growth", "yoy_quarter_revenue_growth", "pct", True),
+        ("Growth", "Earnings growth", "yoy_quarter_earnings_growth", "pct", True),
+        ("Momentum", "20D return", "return_20d", "pct", True),
+        ("Momentum", "60D return", "return_60d", "pct", True),
+        ("Risk Strength", "Risk Strength", "risk_strength", "score", True),
+        ("Dividend", "Dividend yield", "yield_ttm", "pct", True),
+    ]
+
+    def _rv_format(metric_kind, value):
+        if not np.isfinite(value):
+            return "N/A"
+        if metric_kind == "pct":
+            return journal_pct(value)
+        if metric_kind == "multiple":
+            return f"{value:.1f}x"
+        return f"{value:.1f}/100" if metric_kind == "score" else f"{value:.1f}"
+
+    _rv_metric_results = []
+    _rv_min_peer_values = 3
+    for _rv_dimension, _rv_metric, _rv_key, _rv_kind, _rv_higher_better in _rv_metric_specs:
+        _rv_value = n(_rv_row.get(_rv_key))
+        _rv_peer_values = pd.to_numeric(_rv_peer_df[_rv_key], errors="coerce").dropna() if _rv_key in _rv_peer_df else pd.Series(dtype=float)
+        if _rv_kind == "multiple":
+            _rv_peer_values = _rv_peer_values[_rv_peer_values > 0]
+            if not np.isfinite(_rv_value) or _rv_value <= 0:
+                _rv_value = np.nan
+        if not np.isfinite(_rv_value):
+            _rv_metric_results.append({"dimension": _rv_dimension, "metric": _rv_metric, "kind": _rv_kind, "state": "Company metric unavailable"})
+            continue
+        if len(_rv_peer_values) < _rv_min_peer_values:
+            _rv_metric_results.append({"dimension": _rv_dimension, "metric": _rv_metric, "kind": _rv_kind, "value": _rv_value, "state": "Insufficient peer values", "peer_values": len(_rv_peer_values), "peer_required": _rv_min_peer_values})
+            continue
+        _rv_p25, _rv_median, _rv_p75 = [float(item) for item in np.percentile(_rv_peer_values.to_numpy(dtype=float), [25, 50, 75])]
+        _rv_tolerance = max((_rv_p75 - _rv_p25) * .10, 1e-9)
+        if _rv_higher_better:
+            if _rv_value > _rv_p75:
+                _rv_points, _rv_position = 2, "Above P75"
+            elif _rv_value > _rv_median + _rv_tolerance:
+                _rv_points, _rv_position = 1, "Above Median"
+            elif _rv_value >= _rv_median - _rv_tolerance:
+                _rv_points, _rv_position = 0, "Near Median"
+            elif _rv_value >= _rv_p25:
+                _rv_points, _rv_position = -1, "Below Median"
+            else:
+                _rv_points, _rv_position = -2, "Below P25"
+        else:
+            if _rv_value < _rv_p25:
+                _rv_points, _rv_position = 2, "Below P25 · relative discount"
+            elif _rv_value < _rv_median - _rv_tolerance:
+                _rv_points, _rv_position = 1, "Below Median · relative discount"
+            elif _rv_value <= _rv_median + _rv_tolerance:
+                _rv_points, _rv_position = 0, "Near Median"
+            elif _rv_value <= _rv_p75:
+                _rv_points, _rv_position = -1, "Above Median · relative premium"
+            else:
+                _rv_points, _rv_position = -2, "Above P75 · relative premium"
+        _rv_metric_results.append({
+            "dimension": _rv_dimension, "metric": _rv_metric, "kind": _rv_kind,
+            "value": _rv_value, "p25": _rv_p25, "median": _rv_median, "p75": _rv_p75,
+            "points": _rv_points, "position": _rv_position,
+        })
+
+    _rv_dimension_order = ["Quality", "Valuation", "Growth", "Momentum", "Risk Strength", "Dividend"]
+    _rv_dimension_scores = {}
+    _rv_dimension_results = {}
+    for _rv_dimension in _rv_dimension_order:
+        _rv_results = [item for item in _rv_metric_results if item["dimension"] == _rv_dimension]
+        _rv_valid = [item for item in _rv_results if "points" in item]
+        _rv_dimension_results[_rv_dimension] = _rv_valid
+        if _rv_valid:
+            _rv_mean_points = float(np.mean([item["points"] for item in _rv_valid]))
+            _rv_dimension_scores[_rv_dimension] = int(np.floor(_rv_mean_points + .5)) if _rv_mean_points >= 0 else int(np.ceil(_rv_mean_points - .5))
+
+    _rv_comparable_count = len(_rv_dimension_scores)
+    _rv_positive_count = sum(value > 0 for value in _rv_dimension_scores.values())
+    _rv_negative_count = sum(value < 0 for value in _rv_dimension_scores.values())
+    _rv_positive_ratio = _rv_positive_count / _rv_comparable_count if _rv_comparable_count else 0.0
+    _rv_negative_ratio = _rv_negative_count / _rv_comparable_count if _rv_comparable_count else 0.0
+    _rv_net_score = int(sum(_rv_dimension_scores.values()))
+    _rv_critical_limitation = _rv_comparable_count < 3
+    if _rv_critical_limitation:
+        _rv_status_label, _rv_status_css = "Limited", "limited"
+    elif _rv_net_score >= 2 and _rv_positive_ratio >= .60:
+        _rv_status_label, _rv_status_css = "Positive", "positive"
+    elif _rv_net_score <= -2 or _rv_negative_ratio >= .60:
+        _rv_status_label, _rv_status_css = "Caution", "caution"
+    else:
+        _rv_status_label, _rv_status_css = "Neutral", "neutral"
+
+    _rv_dimension_display = {
+        "Quality": "Quality / Profitability",
+        "Valuation": f"Valuation ({_rv_valuation_label})",
+        "Growth": "Growth",
+        "Momentum": "Momentum",
+        "Risk Strength": "Risk Strength",
+        "Dividend": "Dividend · additional evidence",
+    }
+    _rv_rows_html = []
+    _rv_detail_rows = []
+    for _rv_dimension in _rv_dimension_order:
+        _rv_valid = _rv_dimension_results[_rv_dimension]
+        _rv_all_metrics = [item for item in _rv_metric_results if item["dimension"] == _rv_dimension]
+        if _rv_valid:
+            _rv_summary = []
+            for _rv_item in _rv_valid:
+                if _rv_dimension == "Valuation":
+                    _rv_read = "relative discount" if _rv_item["points"] > 0 else ("relative premium" if _rv_item["points"] < 0 else "near median")
+                else:
+                    _rv_read = _rv_item["position"].lower()
+                _rv_value_text = _rv_format(_rv_item["kind"], _rv_item["value"])
+                _rv_summary.append(f'{escape_html(_rv_item["metric"])} {escape_html(_rv_value_text)} · {escape_html(_rv_read)}')
+                _rv_detail_rows.append(
+                    f'<div class="j-exec-view-detail-row"><div class="j-exec-view-detail-head">'
+                    f'<b>{escape_html(_rv_dimension)} · {escape_html(_rv_item["metric"])}</b>'
+                    f'<strong>{_rv_item["points"]:+d} · {escape_html(_rv_item["position"])}</strong></div>'
+                    f'<span>Company {escape_html(_rv_format(_rv_item["kind"], _rv_item["value"]))} · peer P25 '
+                    f'{escape_html(_rv_format(_rv_item["kind"], _rv_item["p25"]))} / median '
+                    f'{escape_html(_rv_format(_rv_item["kind"], _rv_item["median"]))} / P75 '
+                    f'{escape_html(_rv_format(_rv_item["kind"], _rv_item["p75"]))}</span></div>'
+                )
+            if _rv_dimension == "Valuation" and _rv_valuation_key != "pb_mrq":
+                _rv_pb_reference = n(_rv_row.get("pb_mrq"))
+                if np.isfinite(_rv_pb_reference):
+                    _rv_summary.append(f'P/B {escape_html(_rv_format("multiple", _rv_pb_reference))} · reference only')
+            _rv_body = "; ".join(_rv_summary) + "."
+        else:
+            _rv_reason_parts = []
+            for _rv_reason in _rv_all_metrics:
+                if _rv_reason.get("state") == "Company metric unavailable":
+                    _rv_reason_parts.append(f'{escape_html(_rv_reason["metric"])}: company value unavailable')
+                elif _rv_reason.get("state") == "Insufficient peer values":
+                    _rv_available_peer_values = int(_rv_reason.get("peer_values", 0))
+                    _rv_required_peer_values = int(_rv_reason.get("peer_required", _rv_min_peer_values))
+                    _rv_company_value = _rv_format(_rv_reason["kind"], _rv_reason["value"])
+                    _rv_reason_parts.append(
+                        f'{escape_html(_rv_reason["metric"])} {escape_html(_rv_company_value)} '
+                        f'(peer data {_rv_available_peer_values}/{_rv_peer_count}; need {_rv_required_peer_values})'
+                    )
+            _rv_body = "; ".join(_rv_reason_parts) + "." if _rv_reason_parts else "No comparable evidence."
+            if _rv_dimension == "Risk Strength":
+                _rv_body += " Risk factors are detailed in Section 07."
+        _rv_dimension_label = _rv_dimension_display[_rv_dimension]
+        if _rv_dimension in _rv_dimension_scores:
+            _rv_dimension_label += f" ({_rv_dimension_scores[_rv_dimension]:+d})"
+        _rv_rows_html.append(
+            f'<div class="j-exec-view-row"><b>{escape_html(_rv_dimension_label)}</b>'
+            f'<span>{_rv_body}</span></div>'
+        )
+    _rv_peer_preview = _rv_peer_symbols[:5]
+    _rv_peer_text = ", ".join(_rv_peer_preview) if _rv_peer_preview else "No eligible peers"
+    if len(_rv_peer_symbols) > len(_rv_peer_preview):
+        _rv_peer_text += f", +{len(_rv_peer_symbols) - len(_rv_peer_preview)} more"
+    _rv_details_html = "".join(_rv_detail_rows)
+    _rv_positive_pct = _rv_positive_ratio * 100
+    _rv_positive_evidence = f'{_rv_positive_count}/{_rv_comparable_count} ({_rv_positive_pct:.0f}%)' if _rv_comparable_count else "0/0"
+    _rv_rows_html = "".join(_rv_rows_html)
+    _rv_research_html = (
+        f'<div class="j-exec-view-heading"><strong class="j-exec-view-status {_rv_status_css}">{_rv_status_label.upper()}</strong>'
+        f'<span class="j-exec-view-net">Net {_rv_net_score:+d}</span></div>'
+        f'<div class="j-exec-view-balance">Positive {_rv_positive_count}/{_rv_comparable_count} ({_rv_positive_pct:.0f}%) · Negative {_rv_negative_count}/{_rv_comparable_count} · Peer coverage {_rv_comparable_count}/6</div>'
+        f'<div class="j-exec-view-rows">{_rv_rows_html}</div>'
+        f'<details class="j-exec-view-details"><summary>Show metric values and peer quartiles</summary><div class="j-exec-view-detail-list">{_rv_details_html}</div></details>'
+        f'<div class="j-exec-view-meta">Peer basis: {escape_html(_rv_peer_basis)} ({_rv_peer_count})<br>Peers: {escape_html(_rv_peer_text)}</div>'
+        '<details class="j-exec-view-method"><summary>How the status is calculated</summary><div class="j-exec-view-method-copy">Each metric is scored against peer quartiles (+2/+1/0/-1/-2); valuation direction is reversed. Values near median (within 10% of peer IQR) score 0. Metrics are averaged within dimensions, and dimension scores are summed. Positive requires net ≥+2 and ≥60% positive dimensions. Caution means net ≤−2 or ≥60% negative. Limited means fewer than 3 comparable dimensions; otherwise Neutral. Each metric needs at least 3 valid peer values. Dividend is additional Research View evidence, outside Bagger Score. Cash-flow resilience is not inferred. Section 09 mirrors this status.</div></details>'
+        '<div class="j-exec-view-note">Relative peer evidence only · not investment advice.</div>'
+    )
+
     st.markdown(f"""
     <style id="journal-executive-reference-v1">
-    .j-exec-grid{{display:grid;grid-template-columns:1.05fr 1.45fr 1.75fr 1.45fr;gap:10px;width:100%;align-items:stretch;}}
+    .j-exec-grid{{display:grid;grid-template-columns:.9fr 2.2fr 1.4fr;gap:10px;width:100%;align-items:stretch;}}
     .j-exec-card{{min-height:178px!important;box-sizing:border-box!important;background:#fff!important;border:1px solid #d7e6f2!important;border-radius:12px!important;padding:15px 16px!important;box-shadow:0 4px 14px rgba(31,72,108,.045)!important;overflow:hidden!important;}}
     .j-exec-eyebrow{{font-size:12px;letter-spacing:.10em;text-transform:uppercase;color:#5f7890;font-weight:850;margin-bottom:10px;}}
     .j-exec-score{{font-size:48px;line-height:.95;color:#173e64;font-weight:900;letter-spacing:-.05em;margin-top:5px;}}
@@ -40266,9 +40737,29 @@ def journal():
     .j-exec-status.caution{{background:#fff0ef;color:#bd3d42;}}
     .j-exec-status.positive{{background:#eaf8f1;color:#168453;}}
     .j-exec-copy{{font-size:10px;line-height:1.5;color:#647d93;margin-top:10px;}}
-    .j-exec-research-title{{font-size:18px;line-height:1.1;color:#173e64;font-weight:900;}}
-    .j-exec-context-note{{display:flex;align-items:flex-start;gap:8px;margin-top:12px;padding:10px 11px;border:1px solid #dce9f5;border-radius:10px;background:#f5f9ff;color:#5c748a;font-size:10px;line-height:1.45;}}
-    .j-exec-context-icon{{width:18px;height:18px;flex:0 0 18px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:#e4efff;color:#1769df;font-size:11px;font-weight:900;}}
+    .j-exec-view-heading{{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:1px 0 5px;}}
+    .j-exec-view-status{{font-size:17px;line-height:1.1;color:#173e64;font-weight:900;}}
+    .j-exec-view-status.positive{{color:#168453;}}
+    .j-exec-view-status.caution{{color:#bd3d42;}}
+    .j-exec-view-status.limited{{color:#7a668f;}}
+    .j-exec-view-net{{font-size:11px;color:#56738d;font-weight:850;padding:4px 7px;border-radius:999px;background:#f1f6fb;}}
+    .j-exec-view-balance{{font-size:12px;line-height:1.45;color:#647d93;margin-bottom:6px;}}
+    .j-exec-view-rows{{display:flex;flex-direction:column;gap:4px;}}
+    .j-exec-view-details{{margin-top:6px;border-top:1px solid #edf2f7;padding-top:5px;}}
+    .j-exec-view-details summary{{cursor:pointer;font-size:11.5px;font-weight:800;color:#1769d2;list-style-position:inside;}}
+    .j-exec-view-detail-list{{display:grid;gap:5px;margin-top:6px;}}
+    .j-exec-view-detail-row{{padding:6px 0;border-bottom:1px solid #eef3f7;}}
+    .j-exec-view-detail-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:7px;font-size:11.5px;line-height:1.4;}}
+    .j-exec-view-detail-head b{{color:#264d72;}}
+    .j-exec-view-detail-head strong{{flex:0 0 auto;color:#426784;font-size:10px;text-align:right;}}
+    .j-exec-view-detail-row>span{{display:block;font-size:11.5px;line-height:1.5;color:#60788e;margin-top:3px;}}
+    .j-exec-view-method{{margin-top:6px;border-top:1px solid #edf2f7;padding-top:5px;}}
+    .j-exec-view-method-copy{{font-size:11px;line-height:1.5;color:#60788e;margin-top:5px;padding:6px 7px;background:#f5f9fd;border:1px solid #e4edf5;border-radius:7px;}}
+    .j-exec-view-row{{display:grid;grid-template-columns:100px minmax(0,1fr);gap:7px;padding:6px 0;border-bottom:1px solid #eef3f7;font-size:11.5px;line-height:1.45;color:#60788e;}}
+    .j-exec-view-row:last-child{{border-bottom:0;}}
+    .j-exec-view-row b{{color:#264d72;font-weight:850;font-size:11px;}}
+    .j-exec-view-meta{{font-size:11px;line-height:1.45;color:#60788e;margin-top:6px;overflow-wrap:anywhere;}}
+    .j-exec-view-note{{font-size:11px;line-height:1.5;color:#74899c;margin-top:6px;padding:6px 7px;background:#f5f9fd;border:1px solid #e4edf5;border-radius:7px;}}
     .j-exec-takeaways{{display:flex;flex-direction:column;gap:6px;margin-top:5px;}}
     .j-exec-take-row{{display:grid;grid-template-columns:25px 1fr;gap:7px;align-items:center;padding:4px 0;border-bottom:1px solid #eef3f7;}}
     .j-exec-take-row:last-child{{border-bottom:0;}}
@@ -40300,21 +40791,18 @@ def journal():
     </style>
     <div class="j-exec-grid">
       <div class="j-exec-card">
-        <div class="j-exec-eyebrow">BAGGER SCORE</div>
+        <div class="j-exec-eyebrow">{score_heading}</div>
         <div class="j-exec-score">{score_txt}</div>
+        <div class="j-exec-score-note">{score_provenance_html}</div>
         <div class="j-exec-status {research_class}">{signal_clean} · Evidence {evidence}</div>
       </div>
       <div class="j-exec-card">
-        <div class="j-exec-eyebrow">RESEARCH CONTEXT</div>
-        <div class="j-exec-research-title">NON-DIRECTIONAL</div>
-        <div class="j-exec-context-note"><span class="j-exec-context-icon" aria-hidden="true">i</span><span>This panel summarizes independent evidence. It does not calculate an overall market direction or change the Bagger Score.</span></div>
+        <div class="j-exec-eyebrow">RESEARCH VIEW</div>
+        {_rv_research_html}
       </div>
+
       <div class="j-exec-card">
-        <div class="j-exec-eyebrow">KEY TAKEAWAYS</div>
-        <div class="j-exec-takeaways">{takeaway_html}</div>
-      </div>
-      <div class="j-exec-card">
-        <div class="j-exec-eyebrow">SCORING DIMENSION AVAILABILITY</div>
+        <div class="j-exec-eyebrow">COMPANY SCORE LAYER AVAILABILITY</div>
         <div class="j-exec-evidence" role="group" aria-label="Scoring dimension availability">
           <div>
             <div class="j-exec-donut" role="img" aria-label="{cov_pct:.0f} percent; {cov_n} of {cov_t} scoring dimensions available"><b>{cov_pct:.0f}</b></div>
@@ -40324,7 +40812,7 @@ def journal():
             <div class="j-exec-checks" role="list" aria-label="Availability by scoring dimension">
               {_exec_dimension_rows_html}
             </div>
-            <div class="j-exec-coverage-note">This reflects score-layer availability, not completeness of every underlying source input.</div>
+            <div class="j-exec-coverage-note">Availability for the selected company's score layers. Peer comparison coverage is shown in Research View.</div>
           </div>
         </div>
       </div>
@@ -40332,29 +40820,7 @@ def journal():
     <div style="height:2px"></div>
     """, unsafe_allow_html=True)
 
-    st.markdown("""
-    <style id="journal-executive-research-v13">
-    /* Research Context: keep the text clear without implying a directional score */
-    .j-exec-card .j-exec-research-title{
-        font-size:22px!important;
-        line-height:1.1!important;
-        font-weight:900!important;
-        color:#173e64!important;
-        margin-top:1px!important;
-    }
-    .j-exec-card .j-exec-copy{
-        font-size:12px!important;
-        line-height:1.55!important;
-        color:#607b92!important;
-        margin-top:14px!important;
-    }
-    .j-exec-card .j-exec-copy b{
-        font-size:12px!important;
-        font-weight:900!important;
-        color:#4f6f89!important;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+
 
     st.markdown("""
     <style id="journal-fundamental-v17">
@@ -40381,7 +40847,7 @@ def journal():
     # 03 — FUNDAMENTALS
     st.markdown('<div class="j-section"><span class="j-rail">03</span><span class="j-section-title">Fundamental Performance</span><span class="j-section-desc j-fund-section-desc">Historical evidence, operating context & 3-year forward view</span></div>',unsafe_allow_html=True)
     # Key Financial Metrics removed from this section because the same evidence
-    # is already surfaced in Executive View / Key Takeaways. Fundamental
+    # is already surfaced in Executive View / Research View. Fundamental
     # Performance now gives the chart area more room and focuses on price
     # context plus historical and forward operating performance.
     # Verified historical fundamentals + transparent three-year forward level forecast.
@@ -40792,6 +41258,8 @@ def journal():
         if years and forecast_years:
             fig.add_vline(x=len(years)-0.5,line_width=1.4,line_dash='dash',line_color='#8ea8bd')
             fig.add_annotation(x=len(years)-0.5,y=1.07,xref='x',yref='paper',text='Historical        Forecast (E)',showarrow=False,font=dict(size=11,color='#607b94'))
+        if not years and not forecast_years:
+            fig.add_annotation(text='Verified dividend history and forecast inputs are unavailable.',xref='paper',yref='paper',x=0.5,y=0.5,showarrow=False,font=dict(size=13,color='#6f879c'))
         return fig, {'years':years,'dividends':dividends,'yields':yields,'payouts':payouts,'forecast_years':forecast_years,'forecast_div':forecast_div,'forecast_yield':forecast_yield,'forecast_payout':forecast_payout}
 
     # Interactive focus controls: all evidence remains visible; the selected view is emphasized.
@@ -40842,12 +41310,12 @@ def journal():
 
             # V68 — make payout insight reflect the measured payout state.
             # The methodology and forecast calculations remain unchanged.
-            # V67 — restore Dividend Score presentation using the canonical V66 engine.
+            # Dividend Score presentation uses the current evidence-weighted calculation.
             _ds=_dividend_engine if isinstance(_dividend_engine,dict) else {}
             _dividend_score=n(_ds.get('score'))
             _dividend_score_width=float(np.clip(_dividend_score,0,100)) if np.isfinite(_dividend_score) else 0.0
             _dividend_score_status=('Measured evidence' if np.isfinite(_dividend_score) else 'Insufficient evidence')
-            _score_rows=[('Yield',n(_ds.get('yield_score'))),('Payout',n(_ds.get('payout_score'))),('Cash Flow',n(_ds.get('cashflow_score'))),('Consistency',n(_ds.get('consistency_score')))]
+            _score_rows=[('Yield score',n(_ds.get('yield_score'))),('Payout score',n(_ds.get('payout_score'))),('Cash flow score',n(_ds.get('cashflow_score'))),('Consistency score',n(_ds.get('consistency_score')))]
 
             st.markdown(
                 '<div class="j-dividend-insights">'
@@ -40856,7 +41324,7 @@ def journal():
                 f'<div class="j-dividend-insight orange"><div class="j-dividend-insight-head"><span class="j-dividend-insight-icon">%</span><span class="j-dividend-insight-title">Attractive yield</span></div><div class="j-dividend-insight-copy">{yield_copy}</div></div>'
                 f'<div class="j-dividend-insight blue"><div class="j-dividend-insight-head"><span class="j-dividend-insight-icon">◆</span><span class="j-dividend-insight-title">{payout_insight_title}</span></div><div class="j-dividend-insight-copy">{payout_copy}</div></div>'
                 '</div>',unsafe_allow_html=True)
-            st.markdown('<div class="j-dividend-method"><b>Methodology:</b> Dividend Score is a Journal-only 0–100 evidence composite from the V66 dividend engine: verified yield, payout sustainability, cash-flow coverage when applicable, and historical dividend consistency. Missing components remain N/A; available components are re-weighted. It does <b>not</b> feed the Bagger Score. Forecast values are illustrative, not investment recommendations.</div><div class="j-dividend-source"><span class="j-dividend-source-pill">SOURCE · RowletAI Derived</span>Historical dividend/share, yield and implied payout use verified Company Report evidence. Forecast values use the existing Base growth path, latest verified EPS and current payout ratio; forecast yield is shown at the current price.</div>',unsafe_allow_html=True)
+            st.markdown('<div class="j-dividend-method"><b>Methodology:</b> Dividend Score is a separate 0–100 evidence score shown in Company Journal. It combines yield attractiveness (30%), payout sustainability (25%), cash-flow coverage (25% when applicable), and verified dividend consistency (20%). Missing, insufficient, or inapplicable inputs are omitted; the remaining weights are scaled proportionally to total 100%. The score does <b>not</b> contribute to the Bagger Score. Forecast values are illustrative, not investment advice.</div><div class="j-dividend-source"><span class="j-dividend-source-pill">SOURCE · RowletAI Derived</span>Historical dividend/share, yield and implied payout use verified Company Report evidence. Forecast values use the existing Base growth path, latest verified EPS and current payout ratio; forecast yield is shown at the current price.</div>',unsafe_allow_html=True)
 
     with div_right:
         status_e='Strong coverage' if np.isfinite(earnings_coverage) and earnings_coverage>=2.5 else ('Adequate coverage' if np.isfinite(earnings_coverage) and earnings_coverage>=1.5 else ('Limited coverage' if np.isfinite(earnings_coverage) else 'Insufficient evidence'))
@@ -40876,7 +41344,7 @@ def journal():
                 '<div class="j-dividend-sustain-head"><span class="j-dividend-sustain-icon">⬟</span><div><div class="j-dividend-sustain-title">Dividend Sustainability</div><div class="j-dividend-sustain-sub">Coverage metrics based on latest financial evidence</div></div>'
                 f'<div class="j-dividend-score-box"><div class="j-dividend-score-label">Dividend Score</div><div class="j-dividend-score-value">{(f"{_dividend_score:.0f}" if np.isfinite(_dividend_score) else "N/A")}</div><div class="j-dividend-score-status">{_dividend_score_status}</div><div class="j-dividend-score-bar"><span style="width:{_dividend_score_width:.1f}%"></span></div><div class="j-dividend-score-breakdown">'
                 + ''.join([f'<div><span>{lab}</span><b>{(f"{val:.0f}" if np.isfinite(val) else "N/A")}</b></div>' for lab,val in _score_rows])
-                + '</div><div class="j-dividend-score-foot">V66 engine · unavailable evidence is excluded and remaining weights are re-normalized.</div></div></div>'
+                + '</div><div class="j-dividend-score-foot">Component values are 0-100 evidence scores, not yield percentages. Unavailable inputs are omitted; remaining weights are scaled to 100%.</div></div></div>'
                 f'<div class="j-dividend-metric"><div class="j-dividend-metric-top"><div><div class="j-dividend-metric-label">Dividend Yield</div><div class="j-dividend-metric-value">{(journal_pct(latest_y) if np.isfinite(latest_y) else "N/A")}</div></div><span class="j-dividend-status amber">Current</span></div><div class="j-dividend-progress amber"><span style="width:{(min(100,max(0,latest_y*100/20)) if np.isfinite(latest_y) else 0):.1f}%"></span></div><div class="j-dividend-metric-note">Forecast: {(journal_pct(forecast_last_y) if np.isfinite(forecast_last_y) else "N/A")} @ current price</div></div>'
                 f'<div class="j-dividend-metric"><div class="j-dividend-metric-top"><div><div class="j-dividend-metric-label">Earnings Coverage</div><div class="j-dividend-metric-value">{earnings_cov_txt}</div></div><span class="j-dividend-status {ecls}">{status_e}</span></div><div class="j-dividend-progress"><span style="width:{earnings_width:.1f}%"></span></div><div class="j-dividend-metric-note">{earnings_note}</div></div>'
                 f'<div class="j-dividend-metric"><div class="j-dividend-metric-top"><div><div class="j-dividend-metric-label">Cash Flow Coverage</div><div class="j-dividend-metric-value">{("Not applicable" if is_bank else cash_cov_txt)}</div></div><span class="j-dividend-status {ccls}">{status_c}</span></div><div class="j-dividend-progress blue"><span style="width:{cash_width:.1f}%"></span></div><div class="j-dividend-metric-note">{("Bank cash-flow coverage is not used because the methodology is not comparable." if is_bank else cash_note)}</div></div>'
@@ -41170,7 +41638,7 @@ def journal():
             valuation_method=st.selectbox('Valuation Method',available_methods,index=default_method_index,key='valuation_method',label_visibility='collapsed')
         with c3:
             st.markdown('<div class="j-val-control-title">Evidence Source</div>',unsafe_allow_html=True)
-            st.markdown('<div class="j-val-source-badge">✓ Sectors API · Company Report</div>',unsafe_allow_html=True)
+            st.markdown('<div class="j-val-source-badge">✓ Company Report · EPS / Multiples</div>',unsafe_allow_html=True)
         with c4:
             st.markdown('<div class="j-val-control-title">Scenario Settings</div>',unsafe_allow_html=True)
             sca,scb,scc,scd=st.columns([1,1,1,.82],gap='small')
@@ -41308,11 +41776,11 @@ def journal():
     left,right=st.columns([2.28,1.0],gap='medium')
     with left:
         with st.container(border=True,key="valuation-chart-frame"):
-            st.markdown(f'<div class="j-val-chart-head"><div><div class="j-val-chart-title"><span class="j-val-chart-icon">↗</span>Price Simulation &amp; Historical Performance <span style="font-size:10px;color:#71889b;font-weight:700">(Illustrative)</span></div><div class="j-val-chart-sub">Historical price, current price and {horizon_n}-year scenario simulation based on the Section 04 EPS-growth path and selected valuation method.</div></div></div>',unsafe_allow_html=True)
+            st.markdown(f'<div class="j-val-chart-head"><div><div class="j-val-chart-title"><span class="j-val-chart-icon">↗</span>Price Simulation &amp; Historical Performance <span style="font-size:10px;color:#71889b;font-weight:700">(Illustrative)</span></div><div class="j-val-chart-sub">Historical price, current price and {horizon_n}-year scenario simulation based on the Section 04 EPS-growth path and selected valuation method.<br><span class="j-val-history-status">{history_note_html}</span></div></div></div>',unsafe_allow_html=True)
             if not h.empty:
                 st.plotly_chart(journal_price_simulation_chart(h,current_price,scenario_vals,horizon_years=horizon_n),use_container_width=True,config={'displayModeBar':False})
             else:
-                st.plotly_chart(journal_empty_chart('PRICE HISTORY','Daily price series are not available for this symbol in the current Journal dataset.'),use_container_width=True,config={'displayModeBar':False})
+                st.plotly_chart(journal_empty_chart('PRICE HISTORY',history_message),use_container_width=True,config={'displayModeBar':False})
     with right:
         with st.container(border=True,key="valuation-target-frame"):
             st.markdown(f'<div class="j-val-target-title">Scenario Price Targets <span style="font-size:10px;color:#7b8fa2">({horizon_n} Years)</span></div><div class="j-val-target-sub">Projected price targets based on the selected valuation method and scenario assumptions.</div>',unsafe_allow_html=True)
@@ -41328,7 +41796,8 @@ def journal():
                     desc={'Bull':'Higher multiple and stronger EPS-growth assumption.','Base':'Fair value based on the Section 04 EPS-growth path.','Bear':'Lower multiple and conservative EPS-growth assumption.'}[name]
                 mult_txt=f'{multiple_val:.1f}x' if np.isfinite(multiple_val) else 'N/A'
                 scenario_icon={'Bull':'↗','Base':'—','Bear':'↘'}[name]
-                scenario_cards.append(f'<div class="j-val-target-card {css}"><div class="j-val-target-top"><div class="j-val-target-name-wrap"><span class="j-val-target-icon">{scenario_icon}</span><div class="j-val-target-name">{name} Scenario</div></div><span class="j-val-target-return">{ret_txt}</span></div><div class="j-val-target-price">Rp {target:,.0f}</div><div class="j-val-target-meta"><b>{method_label} {mult_txt}</b> &nbsp;|&nbsp; {desc}</div></div>')
+                target_txt=f'Rp {target:,.0f}' if np.isfinite(target) else 'N/A'
+                scenario_cards.append(f'<div class="j-val-target-card {css}"><div class="j-val-target-top"><div class="j-val-target-name-wrap"><span class="j-val-target-icon">{scenario_icon}</span><div class="j-val-target-name">{name} Scenario</div></div><span class="j-val-target-return">{ret_txt}</span></div><div class="j-val-target-price">{target_txt}</div><div class="j-val-target-meta"><b>{method_label} {mult_txt}</b> &nbsp;|&nbsp; {desc}</div></div>')
             st.markdown('<div class="j-val-target-stack">'+''.join(scenario_cards)+'</div>',unsafe_allow_html=True)
 
     # Lower analytical row.
@@ -41435,13 +41904,13 @@ def journal():
     st.markdown(r"""
     <style id="journal-font-readability-audit">
       /* Company Journal readability baseline: no explanatory text below 10px. */
-      .j-growth-chart-caption,.j-growth-chart-range,.j-growth-take-item p{font-size:10px!important}
-      .j-val-pill-note,.j-val-source{font-size:10px!important}
-      .j07-foot{font-size:10px!important;line-height:1.4!important}
-      .j08-item{font-size:10.5px!important;line-height:1.3!important}
-      .j09-item-title{font-size:10.5px!important}
-      .j09-item-desc,.j09-foot{font-size:10px!important;line-height:1.35!important}
-      .j09-panel-sub{font-size:10.5px!important}
+      .j-growth-chart-caption,.j-growth-chart-range,.j-growth-take-item p{font-size:12px!important}
+      .j-val-pill-note,.j-val-source{font-size:12px!important}
+      .j07-foot{font-size:11.5px!important;line-height:1.45!important}
+      .j08-item{font-size:12px!important;line-height:1.45!important}
+      .j09-item-title{font-size:12px!important}
+      .j09-item-desc,.j09-foot{font-size:11.5px!important;line-height:1.45!important}
+      .j09-panel-sub{font-size:11.5px!important}
     </style>
     <style id="journal-sections-07-09-mockup">
       .j07-section{display:flex;align-items:center;gap:10px;margin:20px 0 10px!important}
@@ -41471,14 +41940,14 @@ def journal():
       .j07-bar>span.risk-high{background:#EF3B55}.j07-bar>span.risk-mid{background:#FFB51B}.j07-bar>span.cat{background:#0B9A5A}
       .j07-badge{justify-self:start;padding:7px 11px;border-radius:8px;font-size:11px;font-weight:850;line-height:1;white-space:nowrap}
       .j07-badge.high{background:#FFE0E5;color:#EA2845}.j07-badge.moderate{background:#FFF0C9;color:#C97900}.j07-badge.strong{background:#D7F8E5;color:#0A9857}.j07-badge.positive{background:#DDF8E7;color:#0B9756}.j07-badge.neutral{background:#EDF3F8;color:#54708A}
-      .j07-detail{font-size:12px;line-height:1.25;color:#617B94}
+      .j07-detail{font-size:13px;line-height:1.4;color:#617B94}
       .j07-foot{font-size:9px;line-height:1.35;color:#7890A5;margin-top:6px;padding-top:7px;border-top:1px solid rgba(210,224,235,.72)}
 
       .j08-head{display:flex;align-items:center;justify-content:flex-end;gap:16px;margin-bottom:9px}
       .j08-head .j08-inline-note{margin-left:auto;max-width:535px}
       .j08-section-head .j08-inline-note{margin-left:auto!important;margin-right:0!important;text-align:right!important}
-      .j08-note{max-width:535px;padding:8px 13px;border:1px solid #D7E7F4;background:#F5FAFF;border-radius:10px;color:#607B94;font-size:12px;line-height:1.4}
-      .j08-note b{color:#173E61;font-size:12px}
+      .j08-note{max-width:535px;padding:8px 13px;border:1px solid #D7E7F4;background:#F5FAFF;border-radius:10px;color:#607B94;font-size:13px;line-height:1.5}
+      .j08-note b{color:#173E61;font-size:13px}
       .j08-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-bottom:9px}
       .j08-card{background:#fff;border:1px solid #D7E5F0;border-radius:13px;padding:13px 14px 12px;min-height:247px;box-sizing:border-box;box-shadow:0 3px 12px rgba(30,65,95,.035)}
       .j08-card.growth{--accent:#2F80ED;--accent2:#6C4BEF;--soft:#EEF6FF}
@@ -41489,39 +41958,39 @@ def journal():
       .j08-card.momentum{--accent:#149C71;--accent2:#087D62;--soft:#EAF9F3}
       .j08-top{display:flex;align-items:center;gap:9px;margin-bottom:8px}
       .j08-icon{width:43px;height:43px;min-width:43px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--accent) 13%,white);color:var(--accent);font-size:22px;font-weight:900}
-      .j08-label{font-size:12px;font-weight:900;letter-spacing:.06em;color:#17385C}
+      .j08-label{font-size:13px;font-weight:900;letter-spacing:.06em;color:#17385C}
       .j08-card.quality .j08-label{color:#6A4DE8}.j08-card.risk .j08-label{color:#B72239}.j08-card.momentum .j08-label{color:#087A59}
-      .j08-meta{margin-left:auto;font-size:10px;color:#6D879F;white-space:nowrap}
+      .j08-meta{margin-left:auto;font-size:11.5px;color:#6D879F;white-space:nowrap}
       .j08-score-row{display:flex;align-items:baseline;gap:8px;margin-bottom:7px}
       .j08-score{font-size:34px;line-height:.95;font-weight:900;letter-spacing:-.045em;color:#143B63}
-      .j08-score-meta{font-size:11px;color:#5D7892}
+      .j08-score-meta{font-size:12px;color:#5D7892}
       .j08-progress{height:15px;background:#E8EFF5;border-radius:999px;overflow:hidden;margin:4px 0 10px}
       .j08-progress>span{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
-      .j08-summary{min-height:50px;border-radius:9px;background:var(--soft);padding:10px 11px;font-size:11px;line-height:1.35;color:#385675;margin-bottom:10px}
+      .j08-summary{min-height:50px;border-radius:9px;background:var(--soft);padding:10px 11px;font-size:12.5px;line-height:1.45;color:#385675;margin-bottom:10px}
       .j08-list{display:grid;gap:7px}
-      .j08-item{display:flex;align-items:flex-start;gap:8px;font-size:10px;line-height:1.25;color:#365672}
+      .j08-item{display:flex;align-items:flex-start;gap:8px;font-size:12px;line-height:1.45;color:#365672}
       .j08-check{width:17px;height:17px;min-width:17px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#43B978;color:#fff;font-size:10px;font-weight:900}
       .j08-risk-num{width:17px;height:17px;min-width:17px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#E92F4A;color:#fff;font-size:9px;font-weight:900}
 
       .j09-grid{display:grid;grid-template-columns:1.2fr .9fr .9fr;gap:12px;margin-bottom:8px}
       .j09-thesis{position:relative;overflow:hidden;min-height:222px;border-radius:14px;padding:17px 19px;background:linear-gradient(135deg,#173E8A 0%,#123E83 48%,#075F8D 100%);color:#fff;box-sizing:border-box}
       .j09-thesis:after{content:"";position:absolute;right:-30px;bottom:-35px;width:270px;height:160px;background:repeating-linear-gradient(90deg,rgba(255,255,255,.10) 0 13px,transparent 13px 36px);transform:skewY(-18deg);opacity:.65}
-      .j09-eyebrow{font-size:11px;line-height:1.2;letter-spacing:.15em;font-weight:900;color:#9BD7FF}
+      .j09-eyebrow{font-size:12px;line-height:1.2;letter-spacing:.15em;font-weight:900;color:#9BD7FF}
       .j09-title{font-size:21px;line-height:1.1;font-weight:900;margin-top:5px;color:#fff}
-      .j09-copy{position:relative;z-index:1;max-width:72%;font-size:12px;line-height:1.6;color:#F3F8FF;margin-top:13px}
+      .j09-copy{position:relative;z-index:1;max-width:80%;font-size:14px;line-height:1.55;color:#F3F8FF;margin-top:13px}
       .j09-view{position:absolute;right:17px;bottom:18px;z-index:2;min-width:124px;padding:9px 11px;border-radius:12px;background:rgba(255,255,255,.94);color:#173E61;box-shadow:0 8px 20px rgba(0,0,0,.12)}
-      .j09-view small{display:block;font-size:9px;color:#66819B;margin-bottom:3px}.j09-view b{font-size:13px;color:#159B68}
+      .j09-view small{display:block;font-size:11px;color:#66819B;margin-bottom:3px}.j09-view b{font-size:14px;color:#159B68;font-weight:900;line-height:1.1}.j09-view b.caution{font-size:20px!important;color:#bd3d42!important;font-weight:900!important;line-height:1.1!important}
       .j09-panel{min-height:222px;border:1px solid #D7E5F0;border-radius:14px;padding:14px 15px;background:#F9FCFF;box-sizing:border-box}
       .j09-panel.watch{background:linear-gradient(135deg,#F8FFFB,#F4FCF8);border-color:#D7ECE1}
       .j09-panel-head{display:flex;align-items:center;gap:8px;margin-bottom:9px}
       .j09-panel-icon{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#EAF5FF;color:#2675DF;font-size:18px;font-weight:900}
       .j09-panel.watch .j09-panel-icon{background:#DDF8E9;color:#13935C}
-      .j09-panel-title{font-size:12px;font-weight:900;letter-spacing:.08em;color:#173E61}.j09-panel-sub{font-size:10px;color:#6B849B;margin-top:2px}
+      .j09-panel-title{font-size:12px;font-weight:900;letter-spacing:.08em;color:#173E61}.j09-panel-sub{font-size:11.5px;color:#6B849B;margin-top:2px}
       .j09-item{display:flex;align-items:center;gap:8px;border-radius:9px;background:rgba(255,255,255,.82);padding:7px 8px;margin-top:6px}
       .j09-num{width:28px;height:28px;min-width:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;font-weight:900;background:#43B978}
       .j09-num.blue{background:#3B8DEB}.j09-num.gold{background:#F3B400}.j09-num.red{background:#EA4055}.j09-num.purple{background:#7353E8}
-      .j09-item-text{min-width:0}.j09-item-title{font-size:10px;font-weight:900;color:#173E61;line-height:1.2}.j09-item-desc{font-size:9px;color:#6A8399;line-height:1.25;margin-top:2px}
-      .j09-foot{font-size:9px;color:#7890A4;line-height:1.4;margin-top:8px;padding:0 6px}
+      .j09-item-text{min-width:0}.j09-item-title{font-size:12px;font-weight:900;color:#173E61;line-height:1.2}.j09-item-desc{font-size:11.5px;color:#6A8399;line-height:1.25;margin-top:2px}
+      .j09-foot{font-size:11px;color:#7890A4;line-height:1.4;margin-top:8px;padding:0 6px}
       @media(max-width:1100px){.j07-row{grid-template-columns:32px 1fr 72px 1fr}.j07-row .j07-badge{grid-column:3}.j07-row .j07-detail{grid-column:4}.j08-grid{grid-template-columns:repeat(2,1fr)}.j09-grid{grid-template-columns:1fr}.j09-copy{max-width:78%}}
       @media(max-width:750px){.j07-evidence-grid,.j08-grid{grid-template-columns:1fr}.j07-row{grid-template-columns:32px 1fr 78px;row-gap:5px;padding:9px 0}.j07-row .j07-bar{grid-column:2}.j07-row .j07-badge{grid-column:3;grid-row:2}.j07-row .j07-detail{grid-column:2 / span 2}.j08-grid{grid-template-columns:1fr}.j09-copy{max-width:100%;padding-bottom:58px}}
     </style>
@@ -41725,14 +42194,14 @@ def journal():
         desc=watch_descs[i] if i<len(watch_descs) else f'Monitor {item}.'
         watch_html+=f'<div class="j09-item"><span class="j09-num {watch_icons[i%len(watch_icons)]}">{"↗" if i==0 else "▥" if i==1 else "◉" if i==2 else "◆" if i==3 else "⚠"}</span><div class="j09-item-text"><div class="j09-item-title">{title}</div><div class="j09-item-desc">{desc}</div></div></div>'
 
-    overall='Positive' if np.isfinite(ret20) and np.isfinite(ret60) and ret20>0 and ret60>0 else ('Mixed' if np.isfinite(ret20) and np.isfinite(ret60) and ret20*ret60<0 else 'Measured')
+    overall=_rv_status_label
     st.markdown(f"""
       <div class="j09-grid">
         <div class="j09-thesis">
           <div class="j09-eyebrow">RESEARCH SYNTHESIS</div>
-          <div class="j09-title">Investment Thesis</div>
+          <div class="j09-title">Research Synthesis</div>
           <div class="j09-copy">{thesis_note}</div>
-          <div class="j09-view"><small>Overall Model View</small><b>▥ {overall}</b></div>
+          <div class="j09-view"><small>Overall Model View · Relative Evidence</small><b class="{_rv_status_css}">▥ {overall}</b></div>
         </div>
         <div class="j09-panel">
           <div class="j09-panel-head"><span class="j09-panel-icon">●</span><div><div class="j09-panel-title">KEY TAKEAWAYS</div><div class="j09-panel-sub">What this means</div></div></div>
@@ -41745,6 +42214,35 @@ def journal():
       </div>
       <div class="j09-foot">RowletAI — BAGGER RADAR is a market-intelligence and analytical research tool for the Sectors Hackathon. Scores and signals are derived from available data and the project methodology. They are not investment advice or instructions to buy or sell securities.</div>
     """,unsafe_allow_html=True)
+    _compare_href='?'+urlencode({'page':'compare','symbol':str(symbol),'from_journal':'1'})
+    _compare_symbol=escape_html(symbol)
+    cta_html='''
+    <style id="journal-compare-next-step">
+      .j09-next-step{display:flex;align-items:center;gap:16px;margin:20px 0 10px;padding:22px 24px;border:1px solid #BDDDF8;border-radius:18px;background:linear-gradient(105deg,#E8F4FF,#F7FBFF);box-shadow:0 7px 20px rgba(29,80,130,.08);box-sizing:border-box}
+      .j09-next-icon{width:52px;height:52px;flex:0 0 52px;border:1px solid #D4E8FC;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#fff;color:#1673FF;font-size:30px;font-weight:700;line-height:1}
+      .j09-next-copy{flex:1;min-width:0;color:#173E68}
+      .j09-next-label{display:inline-flex;padding:5px 11px;border-radius:999px;background:#D9EBFF;color:#1768CF;font-size:11px;letter-spacing:.08em;font-weight:800}
+      .j09-next-title{font-size:21px;line-height:1.2;font-weight:800;margin:9px 0 4px;color:#173E68}
+      .j09-next-desc{font-size:14px;line-height:1.5;color:#6783A2}
+      a.j09-next-link{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;gap:9px;min-height:58px;padding:0 24px;border:0;border-radius:15px;background:linear-gradient(100deg,#1768FF,#16A9E8);box-shadow:0 8px 18px rgba(23,104,255,.20);color:#fff;text-decoration:none;font-size:14px;font-weight:800;white-space:nowrap;transition:transform .15s ease,box-shadow .15s ease}
+      a.j09-next-link:hover{color:#fff;text-decoration:none;transform:translateY(-1px);box-shadow:0 11px 22px rgba(23,104,255,.28)}
+      a.j09-next-link:focus-visible{outline:3px solid #7BB8FF;outline-offset:3px}
+      @media(max-width:750px){.j09-next-step{align-items:flex-start;flex-wrap:wrap;padding:18px}.j09-next-icon{width:42px;height:42px;flex-basis:42px;font-size:24px}.j09-next-copy{flex:1 1 calc(100% - 62px)}.j09-next-title{font-size:19px}a.j09-next-link{flex:1 1 100%;width:100%;box-sizing:border-box}}
+    </style>
+    <div class="j09-next-step">
+      <div class="j09-next-icon" aria-hidden="true">&#8594;</div>
+      <div class="j09-next-copy">
+        <span class="j09-next-label">NEXT STEP</span>
+        <div class="j09-next-title">Compare __SYMBOL__ with peers</div>
+        <div class="j09-next-desc">__SYMBOL__ will remain selected as your primary company. Choose peer companies in Compare Insight.</div>
+      </div>
+      <a class="j09-next-link" href="__LINK__" aria-label="Open Compare Insight with __SYMBOL__ selected">Compare with peers <span aria-hidden="true">&#8594;</span></a>
+    </div>
+    '''
+    cta_html='\n'.join(line.strip() for line in cta_html.splitlines())
+    cta_html=cta_html.replace('__SYMBOL__',_compare_symbol).replace('__LINK__',escape_html(_compare_href))
+    st.markdown(cta_html,unsafe_allow_html=True)
+
     st.markdown('</div>',unsafe_allow_html=True)
 
 
@@ -42045,6 +42543,11 @@ def compare():
         r=_row(symbol)
         sector=str(r.get('sector') or '').strip()
         industry=str(r.get('industry') or '').strip()
+
+        # Use the explicitly curated local classification before any API fallback.
+        local_group = get_local_peer_group(symbol)
+        sector = sector or str(local_group.get('sector') or '').strip()
+        industry = industry or str(local_group.get('app_industry') or local_group.get('industry') or '').strip()
         if sector and sector.lower()!='nan' and industry and industry.lower()!='nan':
             return sector, industry
         try:
@@ -42070,14 +42573,19 @@ def compare():
         else:
             base['_mc']=np.nan
 
-        # IMPORTANT: Peer Universe rules must be backed by the same canonical
-        # classification used by Market Intelligence. Local company_profiles can
-        # be stale/blank, so Same Sector rules use the Sectors v2 sector membership
-        # resolver first and only fall back to local classification if the API is
-        # unavailable.
+        # Explicitly configured local coal peers avoid a live lookup for the AADI demo.
+        # Other sector rules use Sectors membership first, then local sector labels.
         if rule in ('Same Sector','Same Sector · Large Cap'):
             cand=base.iloc[0:0].copy()
-            if sector:
+            local_group = get_local_peer_group(selected)
+            local_peer_symbols = {
+                str(item).upper().strip()
+                for item in local_group.get('peer_symbols', [])
+                if str(item).strip()
+            } & set(base['symbol'])
+            if local_peer_symbols:
+                cand=base[base['symbol'].isin(local_peer_symbols)].copy()
+            elif sector:
                 api_symbols=set(mi_sector_symbols(sector))
                 if api_symbols:
                     cand=base[base['symbol'].isin(api_symbols)].copy()
@@ -42100,15 +42608,24 @@ def compare():
                 sector_symbols=set(mi_sector_symbols(sector)) if sector else set()
                 pool=base[base['symbol'].isin(sector_symbols)].copy() if sector_symbols else base.copy()
                 matches=[]
+                report_lookups=[]
+                # Use every locally classified match first. Resolve missing industry
+                # labels only when the local peer sample has fewer than eight entries,
+                # stopping once the sample target is met.
                 for _,row in pool.iterrows():
                     sym=str(row['symbol']).upper().strip()
                     local_ind=str(row.get('industry') or '').strip()
                     if not local_ind or local_ind.lower()=='nan':
-                        _,local_ind=_peer_classification(sym)
-                    if _same(local_ind,industry):
+                        report_lookups.append(sym)
+                    elif _same(local_ind,industry):
                         matches.append(sym)
-                    if len(matches)>=8:
-                        break
+                if len(matches)<8:
+                    for sym in report_lookups:
+                        _,resolved_ind=_peer_classification(sym)
+                        if _same(resolved_ind,industry):
+                            matches.append(sym)
+                        if len(matches)>=8:
+                            break
                 if matches:
                     cand=base[base['symbol'].isin(matches)].copy()
 
@@ -42132,7 +42649,9 @@ def compare():
             cand=cand.sort_values(['_dist','_mc'],ascending=[True,False])
         elif '_mc' in cand:
             cand=cand.sort_values('_mc',ascending=False,na_position='last')
-        return cand.head(5).copy()
+        # Peer Universe statistics use the whole eligible population. Manual
+        # selection remains limited to 1–5 peers by its own control.
+        return cand.copy()
 
     def _metric_series(peers, col):
         vals=pd.to_numeric(peers[col],errors='coerce').dropna() if col in peers else pd.Series(dtype=float)
@@ -42510,7 +43029,13 @@ def compare():
         st.error('No company universe is available for Compare Insight.')
         return
     label_map={s:f"{s.replace('.JK','')} — {_name(s)}" for s in symbols}
-    default_symbol='BBCA' if 'BBCA' in symbols else symbols[0]
+    _handoff_symbol=str(st.query_params.get('symbol','')).upper().strip()
+    default_symbol=_handoff_symbol if _handoff_symbol in symbols else ('BBCA' if 'BBCA' in symbols else symbols[0])
+    if str(st.query_params.get('from_journal','')).strip() == '1':
+        if _handoff_symbol in symbols:
+            st.session_state['ci96_selected_company']=_handoff_symbol
+        if 'from_journal' in st.query_params:
+            del st.query_params['from_journal']
     banner_uri = compare_insight_banner_uri()
     if banner_uri:
         st.markdown(f'''<div class="ci98-banner-image"><img src="{banner_uri}" alt="RowletAI Compare Insight banner"></div>''', unsafe_allow_html=True)
@@ -42542,10 +43067,18 @@ def compare():
                 peer_symbols=peer_df['symbol'].astype(str).tolist() if not peer_df.empty else []
             else:
                 peer_df=df[df['symbol'].astype(str).isin(peer_symbols)].copy()
+            _local_group = get_local_peer_group(selected) if mode == 'Peer Universe' and rule.startswith('Same Sector') else {}
+            _local_group_symbols = {str(item).upper().strip() for item in _local_group.get('peer_symbols', []) if str(item).strip()}
+            _local_group_active = bool(set(peer_symbols).intersection(_local_group_symbols))
             with peer_col:
                 if peer_symbols:
-                    chips=''.join(f'<span class="ci99-peer-chip"><b>{escape_html(str(ps).replace(".JK",""))}</b></span>' for ps in peer_symbols[:5])
-                    st.markdown(f'<div class="ci99-peerbar" style="margin-top:0"><div class="ci99-peerbar-head"><span class="ci99-peerbar-title">Peer set used in analysis</span><span class="ci99-peerbar-meta">{len(peer_symbols)} peer{"s" if len(peer_symbols)!=1 else ""}</span></div><div class="ci99-peer-list">{chips}</div></div>',unsafe_allow_html=True)
+                    visible_peer_count=5 if len(peer_symbols)<=5 else 4
+                    chips=''.join(f'<span class="ci99-peer-chip"><b>{escape_html(str(ps).replace(".JK",""))}</b></span>' for ps in peer_symbols[:visible_peer_count])
+                    if len(peer_symbols)>visible_peer_count:
+                        chips+=f'<span class="ci99-peer-chip ci99-peer-chip-more">+{len(peer_symbols)-visible_peer_count} more</span>'
+                    peer_limit_note=' · local curated' if _local_group_active else (' · industry coverage varies' if mode=='Peer Universe' and rule=='Same Industry' else '')
+                    peer_set_title='Local coal peer set' if _local_group_active else 'Peer set used in analysis'
+                    st.markdown(f'<div class="ci99-peerbar" style="margin-top:0"><div class="ci99-peerbar-head"><span class="ci99-peerbar-title">{peer_set_title}</span><span class="ci99-peerbar-meta">{len(peer_symbols)} peer{"s" if len(peer_symbols)!=1 else ""}{peer_limit_note}</span></div><div class="ci99-peer-list">{chips}</div></div>',unsafe_allow_html=True)
                 else:
                     st.markdown('<div class="ci99-control-sub">Select at least one peer company to activate the comparison.</div>',unsafe_allow_html=True)
     if not peer_symbols:
@@ -42578,7 +43111,7 @@ def compare():
         ('Quality','ROE, ROA',_quality_value(sr),lambda r:_quality_value(r),'green',False),
         ('Valuation',valuation_label,_num(sr.get(valuation_col)),lambda r:_num(r.get(valuation_col)),'amber',True),
         ('Growth','Revenue, Earnings',_growth_value(sr),lambda r:_growth_value(r),'blue',False),
-        ('Dividend','Yield, Payout',_num(sr.get('yield_ttm')),lambda r:_num(r.get('yield_ttm')),'purple',False),
+        ('Dividend','Dividend Yield',_num(sr.get('yield_ttm')),lambda r:_num(r.get('yield_ttm')),'purple',False),
         ('Momentum','20D / 60D Return',_momentum_value(sr),lambda r:_momentum_value(r),'red',False),
     ]
     dim_data=[]
@@ -42670,7 +43203,10 @@ def compare():
             continue
         if np.isfinite(d['val']) and np.isfinite(d['med']):
             delta=d['val']-d['med']
-            scale=max(abs(d['med']), 0.05 if d['name'] in ('Quality','Growth','Dividend','Momentum') else 1.0)
+            floor=0.05 if d['name'] in ('Quality','Growth','Dividend','Momentum') else 1.0
+            # Symmetric normalized distance is bounded below 1, so a median near
+            # zero cannot create an arbitrarily large standout rank.
+            scale=abs(d['val'])+abs(d['med'])+floor
             standout.append((abs(delta)/scale,d,delta))
     standout=sorted(standout,key=lambda x:x[0],reverse=True)[:3]
 
@@ -43241,7 +43777,7 @@ def methodology():
     sectors_visual = (f'<img class="meth-source-icon" src="{sectors_icon}" alt="Sectors.app">' if sectors_icon else '<div class="meth-source-icon-fallback">◎</div>')
     section_1 = (
         '<div class="meth-top-section">' +
-        mhead('1','Data Source','ROWLETAI uses realiable and structured data from Sectors.app to ensure consistent and up-to-date analysis.') +
+        mhead('1','Data Source','Scores use documented deterministic rules. RowletAI combines Sectors.app company reports and market data with local score snapshots; coverage and update dates vary by metric.') +
         '<div class="meth-card-body"><div class="meth-source-layout">'
         '<div class="meth-source-hero">' + sectors_visual + '<b>Sectors.app</b><span>Primary data source for fundamentals, market data, and company information.</span></div>'
         '<div class="meth-source-grid">'
@@ -43319,7 +43855,7 @@ def methodology():
               <div class="meth-weight-box red"><span>Weight</span><strong>15%</strong></div>
             </div>
           </div>
-          <div class="meth-dividend-note-v154"><span class="meth-info-v154">i</span><b>Dividend</b> is analyzed separately in Compare Insight as an additional perspective, but it is not part of the Bagger Score.</div>
+          <div class="meth-dividend-note-v154"><span class="meth-info-v154">i</span><span><b>Separate layers:</b> Compare Insight uses Dividend Yield as a peer-relative dimension. Company Journal Dividend Score uses Yield 30%, Payout 25%, Cash Flow 25% when applicable, and verified Consistency 20%; unavailable inputs are reweighted. Neither contributes to Bagger Score.</span></div>
         </div>
         """, unsafe_allow_html=True)
     with c4:
@@ -43365,12 +43901,12 @@ def methodology():
     with c5:
         st.markdown("""
         <div class="meth-low-section-v155">
-          <div class="meth-low-head-v155"><span class="meth-num">5</span><div><div class="meth-low-title-v155">Signal Classification</div><div class="meth-low-desc-v155">Companies are classified into signals based on their Bagger Score and key criteria.</div></div></div>
+          <div class="meth-low-head-v155"><span class="meth-num">5</span><div><div class="meth-low-title-v155">Signal Classification</div><div class="meth-low-desc-v155">Bagger Score snapshot signal states; Research View and Overall Model View use separate peer-relative rules.</div></div></div>
           <div class="meth-signal-grid-v155">
-            <div class="sig-v155 active"><span class="sig-icon-v155"><svg viewBox="0 0 48 48"><path d="M9 35L31 13M21 13h10v10" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg></span><div><b>Active</b><span>High score with positive signals.<br>Indicates stronger relative potential.</span></div></div>
-            <div class="sig-v155 caution"><span class="sig-icon-v155"><svg viewBox="0 0 48 48"><path d="M7 30c6 0 6-12 12-12s6 12 12 12 6-12 10-12" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round"/></svg></span><div><b>Caution</b><span>Mixed signals.<br>Requires closer monitoring and further analysis.</span></div></div>
-            <div class="sig-v155 limited"><span class="sig-icon-v155"><svg viewBox="0 0 48 48"><path d="M10 24h28" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round"/></svg></span><div><b>Limited</b><span>Lower score or higher risk.<br>Indicates weaker relative profile.</span></div></div>
-            <div class="sig-v155 insufficient"><span class="sig-icon-v155"><svg viewBox="0 0 48 48"><path d="M24 7l17 34H7L24 7Z" fill="currentColor"/><path d="M24 17v12" stroke="#fff" stroke-width="4" stroke-linecap="round"/><circle cx="24" cy="35" r="2.3" fill="#fff"/></svg></span><div><b>Insufficient</b><span>Data not sufficient for reliable analysis.<br>Key metrics are unavailable or inconsistent.</span></div></div>
+            <div class="sig-v155 active"><span class="sig-icon-v155"><svg viewBox="0 0 48 48"><path d="M9 35L31 13M21 13h10v10" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg></span><div><b>Strong Composite</b><span>Strong composite signal in the score snapshot. This is not an investment recommendation.</span></div></div>
+            <div class="sig-v155 caution"><span class="sig-icon-v155"><svg viewBox="0 0 48 48"><path d="M7 30c6 0 6-12 12-12s6 12 12 12 6-12 10-12" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round"/></svg></span><div><b>Balanced Composite</b><span>The score snapshot classifies the composite evidence as balanced.</span></div></div>
+            <div class="sig-v155 limited"><span class="sig-icon-v155"><svg viewBox="0 0 48 48"><path d="M10 24h28" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round"/></svg></span><div><b>Weak / Low Composite</b><span>WEAK and LOW are separate snapshot states indicating reduced composite strength.</span></div></div>
+            <div class="sig-v155 insufficient"><span class="sig-icon-v155"><svg viewBox="0 0 48 48"><path d="M24 7l17 34H7L24 7Z" fill="currentColor"/><path d="M24 17v12" stroke="#fff" stroke-width="4" stroke-linecap="round"/><circle cx="24" cy="35" r="2.3" fill="#fff"/></svg></span><div><b>Insufficient Evidence</b><span>Required inputs do not support publishing a reliable composite score.</span></div></div>
           </div>
         </div>
         """, unsafe_allow_html=True)
@@ -43582,7 +44118,7 @@ div[data-testid="stElementContainer"]:has(> div > div[data-testid="stMarkdownCon
 </style>""", unsafe_allow_html=True)
 
 with st.sidebar:
-    logo_uri = sidebar_asset_uri("rowletai_brand_clean.png")
+    logo_uri = sidebar_asset_uri("rowletai_brand_growth_arrow.png")
     stat_company_uri = sidebar_asset_uri("stat_companies.png")
     stat_scored_uri = sidebar_asset_uri("stat_scored.png")
     stat_strong_uri = sidebar_asset_uri("stat_strong.png")
@@ -46738,7 +47274,7 @@ st.markdown(r"""<style id="company-journal-executive-heading-v6">
     margin-bottom:10px!important;
 }
 .j-exec-score{font-size:54px!important;line-height:1!important;font-weight:900!important;}
-.j-exec-research-title{font-size:22px!important;line-height:1.15!important;font-weight:900!important;}
+.j-exec-view-status{font-size:22px!important;line-height:1.15!important;font-weight:900!important;}
 .j-exec-copy{font-size:12px!important;line-height:1.5!important;}
 .j-exec-take-row b{font-size:13px!important;}
 .j-exec-take-row small{font-size:12px!important;line-height:1.35!important;}
@@ -46756,7 +47292,7 @@ st.markdown(r"""<style id="company-journal-executive-heading-v6">
 st.markdown(r"""<style id="company-journal-executive-reference-v10">
 /* Overall geometry: closer to the supplied reference layout */
 .j-exec-grid{
-    grid-template-columns:.78fr .98fr 1.22fr 1.02fr!important;
+    grid-template-columns:.8fr 2fr 1.2fr!important;
     gap:10px!important;
     align-items:stretch!important;
 }
@@ -46793,10 +47329,82 @@ st.markdown(r"""<style id="company-journal-executive-reference-v10">
 }
 
 /* Research View */
-.j-exec-research-title{
+.j-exec-view-status{
     font-size:24px!important;
     line-height:1.1!important;
     font-weight:900!important;
+}
+/* Readable Research View details and methodology */
+.j-exec-view-balance{
+    font-size:13px!important;
+    line-height:1.55!important;
+}
+.j-exec-view-row{
+    grid-template-columns:180px minmax(0,1fr)!important;
+    gap:10px!important;
+    padding:8px 0!important;
+    font-size:13px!important;
+    line-height:1.5!important;
+}
+.j-exec-view-row b{
+    font-size:13px!important;
+    line-height:1.4!important;
+}
+.j-exec-view-details summary,
+.j-exec-view-method summary{
+    cursor:pointer!important;
+    font-size:14px!important;
+    line-height:1.4!important;
+    font-weight:800!important;
+    color:#1769d2!important;
+    list-style-position:inside!important;
+}
+.j-exec-view-detail-head{
+    gap:9px!important;
+    font-size:13px!important;
+    line-height:1.45!important;
+}
+.j-exec-view-detail-head strong{
+    font-size:12.5px!important;
+    line-height:1.4!important;
+}
+.j-exec-view-detail-row>span{
+    font-size:13px!important;
+    line-height:1.55!important;
+}
+.j-exec-view-meta{
+    font-size:12.5px!important;
+    line-height:1.5!important;
+}
+.j-exec-view-method-copy{
+    font-size:13px!important;
+    line-height:1.55!important;
+}
+.j-exec-view-note{
+    font-size:12.5px!important;
+    line-height:1.55!important;
+}
+
+/* Larger labels and availability states */
+.j-exec-check{
+    grid-template-columns:18px minmax(0,1fr) auto!important;
+    gap:8px!important;
+    padding:7px 0!important;
+    font-size:14px!important;
+    line-height:1.45!important;
+}
+.j-exec-check>span:first-child{
+    font-size:14px!important;
+    line-height:1.2!important;
+}
+.j-exec-check b{
+    font-size:12.5px!important;
+    line-height:1.35!important;
+}
+.j-exec-coverage-note{
+    font-size:12px!important;
+    line-height:1.5!important;
+    margin-top:10px!important;
 }
 .j-exec-copy{
     font-size:13.5px!important;
@@ -46871,13 +47479,25 @@ st.markdown(r"""<style id="company-journal-executive-reference-v10">
     padding-top:2px!important;
 }
 .j-exec-check{
-    font-size:12px!important;
-    line-height:1.35!important;
-    gap:7px!important;
+    font-size:14px!important;
+    line-height:1.45!important;
+    gap:8px!important;
 }
 .j-exec-check span{
+    font-size:14px!important;
+    line-height:1.25!important;
+}
+.j-exec-check>span:first-child{
+    font-size:14px!important;
+}
+.j-exec-check b{
+    font-size:12.5px!important;
+    line-height:1.35!important;
+}
+.j-exec-coverage-note{
     font-size:12px!important;
-    line-height:1.1!important;
+    line-height:1.5!important;
+    margin-top:10px!important;
 }
 
 @media(max-width:1050px){
@@ -46889,6 +47509,10 @@ st.markdown(r"""<style id="company-journal-executive-reference-v10">
     .j-exec-card{min-height:0!important;}
     .j-exec-eyebrow{font-size:13px!important;}
     .j-exec-score{font-size:60px!important;}
+    .j-exec-view-row{grid-template-columns:145px minmax(0,1fr)!important;gap:8px!important;}
+}
+@media(max-width:430px){
+    .j-exec-view-row{grid-template-columns:125px minmax(0,1fr)!important;}
 }
 </style>""", unsafe_allow_html=True)
 
@@ -48847,3 +49471,32 @@ st.markdown(r'''<style id="methodology-v179-section1-source-overlap-fix">
   min-height:232px!important;
 }
 </style>''', unsafe_allow_html=True)
+
+
+# Readability and contrast fixes from the application audit.
+st.markdown(r'''<style id="audit-readability-overrides">
+.j-exec-score-note,.j-val-history-status{display:block!important;font-size:12.5px!important;line-height:1.5!important;color:#526b83!important;margin-top:5px!important;}
+.j-exec-view-balance{font-size:13px!important;line-height:1.55!important;color:#526b83!important;}
+.j-exec-view-row{grid-template-columns:minmax(150px,25%) minmax(0,1fr)!important;font-size:13.5px!important;line-height:1.5!important;color:#526b83!important;}
+.j-exec-view-row b{font-size:13px!important;line-height:1.45!important;color:#264d72!important;}
+.j-exec-view-details summary,.j-exec-view-method summary{font-size:14px!important;line-height:1.45!important;}
+.j-exec-view-detail-head{font-size:13px!important;line-height:1.5!important;}
+.j-exec-view-detail-head strong,.j-exec-view-detail-row>span{font-size:12.5px!important;line-height:1.55!important;color:#526b83!important;}
+.j-exec-view-meta,.j-exec-view-note,.j-exec-view-method-copy{font-size:12.5px!important;line-height:1.55!important;color:#526b83!important;}
+.j09-item-title{font-size:13px!important;line-height:1.35!important;}
+.j09-item-desc,.j09-foot,.j09-panel-sub{font-size:12.5px!important;line-height:1.5!important;color:#526b83!important;}
+.j09-panel-title{font-size:13px!important;}
+.j-exec-check{font-size:12.5px!important;line-height:1.45!important;}
+.j-exec-check b,.j-exec-coverage-note{font-size:11.5px!important;line-height:1.5!important;}
+.j-exec-take-row b{font-size:12px!important;}
+.j-exec-take-row small{font-size:11.5px!important;line-height:1.4!important;color:#526b83!important;}
+.j-head-label{font-size:11px!important;color:#526b83!important;}
+.footer{font-size:11.5px!important;line-height:1.55!important;color:#526b83!important;}
+.meth-top-section:nth-child(2) .meth-chart-caption{font-size:10.5px!important;line-height:1.3!important;color:#526b83!important;padding-top:14px!important;}
+.meth-top-section:nth-child(2) .meth-chart-caption b{font-size:10.5px!important;}
+.meth-top-section:nth-child(2) .meth-point .meth-label{font-size:10px!important;}
+.meth-weight-box span{font-size:10.5px!important;line-height:1.25!important;}
+.meth-dividend-note-v154{font-size:10.5px!important;line-height:1.35!important;}
+.meth-score-stage>span:last-child{font-size:10.5px!important;line-height:1.35!important;}
+@media(max-width:600px){.j-exec-view-row{grid-template-columns:minmax(118px,34%) minmax(0,1fr)!important;gap:8px!important;}}
+</style>''',unsafe_allow_html=True)

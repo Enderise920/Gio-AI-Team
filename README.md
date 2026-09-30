@@ -63,6 +63,14 @@ Photo-provider keys are optional. Add `UNSPLASH_ACCESS_KEY`, `PEXELS_API_KEY`, o
 
 Do not commit `.env`, `.streamlit/secrets.toml`, or any API credentials. Use `.env.example` as the names-only template.
 
+## Curated peer comparisons
+
+The optional `data/local_peer_groups.json` file contains explicitly curated peer groups used by Compare Insight when a local demonstration group is configured. The current AADI.JK group is an illustrative coal-producer peer set; it is not official index membership, a Sectors-provided classification, or investment advice.
+
+For a configured group, the app uses the local peer symbols and classification before making a sector/company-report lookup for that comparison. Other peer rules use available Sectors membership or local classifications; constrained comparisons are not silently replaced with unrelated companies.
+
+Review the group metadata, source references, and `updated_at` date when maintaining this file.
+
 ## Stack
 
 Python, Streamlit, pandas, NumPy, Plotly, and the Sectors REST API v2.
