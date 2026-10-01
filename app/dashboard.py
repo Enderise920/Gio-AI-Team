@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import streamlit.components.v1 as components
 
 st.set_page_config(page_title='RowletAI — Bagger Radar', page_icon='✦', layout='wide', initial_sidebar_state='expanded')
 # Home is a full visual landing/dashboard. The artwork contains the reference
@@ -36287,7 +36286,7 @@ def pulse():
     # Interactive workflow controller. Hover previews a step; clicking scrolls
     # to it; scrolling the page updates the active step automatically.
     # The controller iframe is only 1px high and therefore creates no visible gap.
-    components.html("""
+    st.iframe("""
     <script>
     (() => {
       const parentWindow = window.parent;
@@ -36428,7 +36427,7 @@ def pulse():
       updateFromScroll();
     })();
     </script>
-    """, height=1, scrolling=False)
+    """, height=1)
 
 
     c1, c2 = st.columns([0.92, 1.08], gap="small")
@@ -36478,13 +36477,13 @@ def pulse():
                     for col, option in zip(row1, ["ALL", "HIGH", "MEDIUM"]):
                         with col:
                             label = "All" if option == "ALL" else option.title()
-                            if st.button(label, key=f"mi3_ev_{option.lower()}", type="primary" if st.session_state["mi3_evidence_choice"] == option else "secondary", use_container_width=True):
+                            if st.button(label, key=f"mi3_ev_{option.lower()}", type="primary" if st.session_state["mi3_evidence_choice"] == option else "secondary", width="stretch"):
                                 st.session_state["mi3_evidence_choice"] = option
                                 st.rerun()
                     row2 = st.columns(2, gap="small")
                     for col, option in zip(row2, ["LOW", "INSUFFICIENT"]):
                         with col:
-                            if st.button(option.title(), key=f"mi3_ev_{option.lower()}", type="primary" if st.session_state["mi3_evidence_choice"] == option else "secondary", use_container_width=True):
+                            if st.button(option.title(), key=f"mi3_ev_{option.lower()}", type="primary" if st.session_state["mi3_evidence_choice"] == option else "secondary", width="stretch"):
                                 st.session_state["mi3_evidence_choice"] = option
                                 st.rerun()
 
@@ -36495,13 +36494,13 @@ def pulse():
                     for col, option in zip(row1, ["ALL", "ACTIVE"]):
                         with col:
                             label = "All" if option == "ALL" else option.title()
-                            if st.button(label, key=f"mi3_liq_{option.lower()}", type="primary" if st.session_state["mi3_liquidity_choice"] == option else "secondary", use_container_width=True):
+                            if st.button(label, key=f"mi3_liq_{option.lower()}", type="primary" if st.session_state["mi3_liquidity_choice"] == option else "secondary", width="stretch"):
                                 st.session_state["mi3_liquidity_choice"] = option
                                 st.rerun()
                     row2 = st.columns(2, gap="small")
                     for col, option in zip(row2, ["CAUTION", "LIMITED"]):
                         with col:
-                            if st.button(option.title(), key=f"mi3_liq_{option.lower()}", type="primary" if st.session_state["mi3_liquidity_choice"] == option else "secondary", use_container_width=True):
+                            if st.button(option.title(), key=f"mi3_liq_{option.lower()}", type="primary" if st.session_state["mi3_liquidity_choice"] == option else "secondary", width="stretch"):
                                 st.session_state["mi3_liquidity_choice"] = option
                                 st.rerun()
 
@@ -36552,9 +36551,9 @@ def pulse():
                 """)
             with action_download:
                 export_cols=[c for c in ["symbol","company_name","sector","industry","bagger_score","growth_score","quality_score","valuation_score","momentum_score","risk_score","evidence_level","liquidity_flag"] if c in filtered.columns]
-                st.download_button("↓ Download Results", data=filtered[export_cols].to_csv(index=False), file_name="rowletai_market_intelligence_results.csv", mime="text/csv", key="mi3_download_results", use_container_width=True)
+                st.download_button("↓ Download Results", data=filtered[export_cols].to_csv(index=False), file_name="rowletai_market_intelligence_results.csv", mime="text/csv", key="mi3_download_results", width="stretch")
             with action_reset:
-                if st.button("↻ Reset Filters", key="mi3_reset_filters", type="secondary", use_container_width=True):
+                if st.button("↻ Reset Filters", key="mi3_reset_filters", type="secondary", width="stretch"):
                     for key in ["mi3_min_score","mi3_evidence_choice","mi3_liquidity_choice","mi3_sector"]:
                         st.session_state.pop(key, None)
                     st.rerun()
@@ -36963,7 +36962,7 @@ def pulse():
                          font=dict(size=11,color="#123b68",family="Inter, sans-serif"),x=.5,y=.390)
                 ]
             )
-            st.plotly_chart(donut,use_container_width=True,config={"displaylogo":False,"staticPlot":True},key="mi3_signal_donut")
+            st.plotly_chart(donut,width="stretch",config={"displaylogo":False,"staticPlot":True},key="mi3_signal_donut")
 
             rows=[]
             for (_,label,color),count,txt in zip(signal_defs,signal_counts,donut_text):
@@ -37072,7 +37071,7 @@ The position shows its Momentum and Quality score, the size shows the Bagger Sco
 
                 st.plotly_chart(
                     fig,
-                    use_container_width=True,
+                    width="stretch",
                     on_select=_select_mi3_company_from_map,
                     selection_mode="points",
                     config={"displaylogo":False,"scrollZoom":True,"modeBarButtonsToRemove":["lasso2d","select2d"]},
@@ -37524,7 +37523,7 @@ def radar():
     vals=[f'{len(x):,}','—' if x.empty else f'{x.bagger_score.mean():.1f}','—' if x.empty else f'{x.growth_score.mean():.1f}','—' if x.empty else f'{x.momentum_score.mean():.1f}']
     for col,label,v,note in zip(c,['Matches','Avg Score','Growth','Momentum'],vals,['current filters','filtered universe','dimension','dimension']):
         with col:kpi(label,v,note)
-    cols=[c for c in ['symbol','company_name','bagger_score','growth_score','quality_score','valuation_score','momentum_score','risk_score','evidence_level','composite_signal'] if c in x];t=x.sort_values('bagger_score',ascending=False)[cols].rename(columns={'symbol':'Ticker','company_name':'Company','bagger_score':'Score','growth_score':'Growth','quality_score':'Quality','valuation_score':'Valuation','momentum_score':'Momentum','risk_score':'Risk','evidence_level':'Evidence','composite_signal':'Signal'});st.dataframe(t.round(1),use_container_width=True,hide_index=True)
+    cols=[c for c in ['symbol','company_name','bagger_score','growth_score','quality_score','valuation_score','momentum_score','risk_score','evidence_level','composite_signal'] if c in x];t=x.sort_values('bagger_score',ascending=False)[cols].rename(columns={'symbol':'Ticker','company_name':'Company','bagger_score':'Score','growth_score':'Growth','quality_score':'Quality','valuation_score':'Valuation','momentum_score':'Momentum','risk_score':'Risk','evidence_level':'Evidence','composite_signal':'Signal'});st.dataframe(t.round(1),width="stretch",hide_index=True)
 
 def history(symbol):
     try:raw=load(FILES['daily'])
@@ -40891,7 +40890,7 @@ def journal():
                     unsafe_allow_html=True
                 )
                 if not fund_curve.empty and fund_curve[col].notna().any():
-                    st.plotly_chart(journal_fundamental_forecast_chart(fund_curve,col,title,unit),use_container_width=True,config={'displayModeBar':False})
+                    st.plotly_chart(journal_fundamental_forecast_chart(fund_curve,col,title,unit),width="stretch",config={'displayModeBar':False})
                     st.markdown(journal_fundamental_kpi_html(fund_curve,col,unit),unsafe_allow_html=True)
                 else:
                     st.markdown('<div class="j-placeholder">Historical / forecast level series: <b>N/A</b><br>Verified Company Report data or forward growth evidence is not available for this metric.</div>',unsafe_allow_html=True)
@@ -40998,7 +40997,7 @@ def journal():
                             _metric,
                             key=f'journal_growth_metric_btn_v40_{_i}',
                             type='primary' if selected_metric==_metric else 'secondary',
-                            use_container_width=True,
+                            width="stretch",
                         ):
                             st.session_state[metric_state_key]=_metric
                             selected_metric=_metric
@@ -41026,7 +41025,7 @@ def journal():
                         unsafe_allow_html=True)
                     st.plotly_chart(
                         journal_growth_chart(fc,fund_hist,metric=metric_key),
-                        use_container_width=True,
+                        width="stretch",
                         config={'displayModeBar':False},
                         key=f'journal-growth-v37-{metric_key}'
                     )
@@ -41273,7 +41272,7 @@ def journal():
             div_view='Forecast View'
             div_fig,div_meta=journal_dividend_chart(journal_report,fc,current_price,div_view)
             st.markdown('<div class="j-dividend-chart-frame">',unsafe_allow_html=True)
-            st.plotly_chart(div_fig,use_container_width=True,config={'displayModeBar':False})
+            st.plotly_chart(div_fig,width="stretch",config={'displayModeBar':False})
             st.markdown('</div>',unsafe_allow_html=True)
 
             hist_divs=div_meta.get('dividends') or []
@@ -41695,7 +41694,7 @@ def journal():
                         st.markdown(f'<style>.st-key-scenario-bull-control [data-baseweb=\"slider\"] > div > div{{background:linear-gradient(to right,#159447 0%,#159447 {_bull_pe_pct:.3f}%,#e4eaf0 {_bull_pe_pct:.3f}%,#e4eaf0 100%)!important}}.st-key-scenario-bull-control [data-baseweb=\"slider\"] [role=\"slider\"]{{background:#159447!important;border-color:#159447!important;box-shadow:0 0 0 1px #159447!important}}</style>',unsafe_allow_html=True)
             with scd:
                 st.markdown('<div style="height:17px"></div>',unsafe_allow_html=True)
-                if st.button('↻  Reset',key='valuation_reset',use_container_width=True):
+                if st.button('↻  Reset',key='valuation_reset',width="stretch"):
                     for k,v in [('valuation_bear_pe',8.0),('valuation_base_pe',10.0),('valuation_bull_pe',12.0)]: st.session_state[k]=v
                     for k in [x for x in list(st.session_state.keys()) if str(x).startswith('valuation_bear_pb_') or str(x).startswith('valuation_base_pb_') or str(x).startswith('valuation_bull_pb_')]: st.session_state.pop(k,None)
                     st.rerun()
@@ -41778,9 +41777,9 @@ def journal():
         with st.container(border=True,key="valuation-chart-frame"):
             st.markdown(f'<div class="j-val-chart-head"><div><div class="j-val-chart-title"><span class="j-val-chart-icon">↗</span>Price Simulation &amp; Historical Performance <span style="font-size:10px;color:#71889b;font-weight:700">(Illustrative)</span></div><div class="j-val-chart-sub">Historical price, current price and {horizon_n}-year scenario simulation based on the Section 04 EPS-growth path and selected valuation method.<br><span class="j-val-history-status">{history_note_html}</span></div></div></div>',unsafe_allow_html=True)
             if not h.empty:
-                st.plotly_chart(journal_price_simulation_chart(h,current_price,scenario_vals,horizon_years=horizon_n),use_container_width=True,config={'displayModeBar':False})
+                st.plotly_chart(journal_price_simulation_chart(h,current_price,scenario_vals,horizon_years=horizon_n),width="stretch",config={'displayModeBar':False})
             else:
-                st.plotly_chart(journal_empty_chart('PRICE HISTORY',history_message),use_container_width=True,config={'displayModeBar':False})
+                st.plotly_chart(journal_empty_chart('PRICE HISTORY',history_message),width="stretch",config={'displayModeBar':False})
     with right:
         with st.container(border=True,key="valuation-target-frame"):
             st.markdown(f'<div class="j-val-target-title">Scenario Price Targets <span style="font-size:10px;color:#7b8fa2">({horizon_n} Years)</span></div><div class="j-val-target-sub">Projected price targets based on the selected valuation method and scenario assumptions.</div>',unsafe_allow_html=True)
@@ -41857,7 +41856,7 @@ def journal():
                     st.button(
                         _label,
                         key=f'valuation_method_tab_{_key}',
-                        use_container_width=True,
+                        width="stretch",
                         type='primary' if _active else 'secondary',
                         on_click=_switch_valuation_method,
                         args=(_key,),
@@ -43307,7 +43306,7 @@ def compare():
                 fig.update_layout(height=250,margin=dict(l=30,r=18,t=4,b=38),paper_bgcolor='#fff',plot_bgcolor='#fff',showlegend=False,xaxis=dict(title=dist_metric,title_font=dict(size=14,color='#526d88'),tickfont=dict(size=12,color='#617b95'),showline=True,linecolor='#9fb3c8',linewidth=1.2,mirror=False,gridcolor='#edf2f7',gridwidth=1,zeroline=False,ticks='outside',tickcolor='#9fb3c8',ticklen=5,tickformat=pct_tickformat if fmt=='pct' else None),yaxis=dict(visible=True,range=[-.55,.55],showticklabels=False,showline=True,linecolor='#d3dee9',linewidth=1,gridcolor='rgba(0,0,0,0)',zeroline=False,ticks=''))
             else:
                 fig.update_layout(height=190,margin=dict(l=15,r=15,t=5,b=20),paper_bgcolor='#fff',annotations=[dict(text='Insufficient comparable data',xref='paper',yref='paper',x=.5,y=.5,showarrow=False,font=dict(color='#7890a7',size=12))],xaxis=dict(visible=False),yaxis=dict(visible=False))
-            st.plotly_chart(fig,use_container_width=True,config={'displayModeBar':False})
+            st.plotly_chart(fig,width="stretch",config={'displayModeBar':False})
     with r:
         with st.container(border=True, key="ci118_peer_map"):
             mapdf=pr.copy(); mapdf['_x']=pd.to_numeric(mapdf.get(valuation_col),errors='coerce'); mapdf['_y']=mapdf.apply(_quality_value,axis=1); mapdf=mapdf.dropna(subset=['_x','_y']); mapdf=mapdf[mapdf['_x']>0]
@@ -43336,7 +43335,7 @@ def compare():
             _map_y_pad=max(0.035,(_map_y_max-_map_y_min)*0.18)
             _map_y_range=[max(0.0,_map_y_min-_map_y_pad),min(1.0,_map_y_max+_map_y_pad)]
             fig.update_layout(height=250,margin=dict(l=58,r=16,t=38,b=78),paper_bgcolor='#fff',plot_bgcolor='#fff',xaxis=dict(title=f'Valuation ({valuation_label})',title_font=dict(size=14,color='#526d88'),tickfont=dict(size=12,color='#617b95'),showline=True,linecolor='#8fa7bd',linewidth=1.2,mirror=False,gridcolor='#e8eff6',gridwidth=1,zeroline=False,ticks='outside',tickcolor='#8fa7bd',ticklen=5),yaxis=dict(title='Quality (ROE + ROA)',title_font=dict(size=14,color='#526d88'),tickfont=dict(size=12,color='#617b95'),tickformat='.1%',range=_map_y_range,showline=True,linecolor='#8fa7bd',linewidth=1.2,mirror=False,gridcolor='#e8eff6',gridwidth=1,zeroline=False,ticks='outside',tickcolor='#8fa7bd',ticklen=5),legend=dict(orientation='h',y=-0.22,x=1,xanchor='right',yanchor='top',font=dict(size=12,color='#526d88'),bgcolor='rgba(255,255,255,0)'),showlegend=True)
-            st.plotly_chart(fig,use_container_width=True,config={'displayModeBar':False})
+            st.plotly_chart(fig,width="stretch",config={'displayModeBar':False})
 
     # ------------------------- strength / why / watch -------------------------
     st.markdown('<div class="ci96-section-gap"></div>',unsafe_allow_html=True)
